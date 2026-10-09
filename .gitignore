@@ -448,6 +448,9 @@ DerivedData/
 # Don't accidently commit the diabdat.mpq or any other MPQ files
 *.mpq
 
+# Diablo Assets folder (reference copies, not part of the project source)
+/Diablo Assets/
+
 ### Nintendo Switch ###
 exefs/main
 /out/isenseconfig/CPI-Debug

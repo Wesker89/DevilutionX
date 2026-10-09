@@ -50,6 +50,7 @@
 #include "engine/load_file.hpp"
 #include "engine/random.hpp"
 #include "engine/render/clx_render.hpp"
+#include "engine/render/fp_render.hpp"
 #include "engine/sound.h"
 #include "game_mode.hpp"
 #include "gamemenu.h"
@@ -760,6 +761,11 @@ void GameEventHandler(const SDL_Event &event, uint16_t modState)
 		return;
 	}
 
+	// Handle first-person input when in FP mode
+	if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+		HandleFirstPersonInput(event);
+	}
+
 #ifdef _DEBUG
 	if (ConsoleHandleEvent(event)) {
 		return;
@@ -778,24 +784,55 @@ void GameEventHandler(const SDL_Event &event, uint16_t modState)
 
 	switch (event.type) {
 	case SDL_EVENT_KEY_DOWN:
-		PressKey(SDLC_EventKey(event), modState);
-		return;
 	case SDL_EVENT_KEY_UP:
-		ReleaseKey(SDLC_EventKey(event));
+		if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+			// Let first-person handler process movement keys (WASD, etc.)
+			// but still allow other keys to work normally
+			SDL_Keycode key = SDLC_EventKey(event);
+			if (key != SDLK_w && key != SDLK_a && key != SDLK_s && key != SDLK_d &&
+			    key != SDLK_SPACE && key != SDLK_LCTRL && key != SDLK_LSHIFT) {
+				if (event.type == SDL_EVENT_KEY_DOWN)
+					PressKey(key, modState);
+				else
+					ReleaseKey(key);
+			}
+		} else {
+			if (event.type == SDL_EVENT_KEY_DOWN)
+				PressKey(SDLC_EventKey(event), modState);
+			else
+				ReleaseKey(SDLC_EventKey(event));
+		}
 		return;
 	case SDL_EVENT_MOUSE_MOTION:
-		if (ControlMode == ControlTypes::KeyboardAndMouse && invflag)
-			InvalidateInventorySlot();
-		MousePosition = { SDLC_EventMotionIntX(event), SDLC_EventMotionIntY(event) };
-		gmenu_on_mouse_move();
+		if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+			// Let first-person handler process mouse motion for camera rotation
+			// Don't update game MousePosition when mouse look is active
+		} else {
+			if (ControlMode == ControlTypes::KeyboardAndMouse && invflag)
+				InvalidateInventorySlot();
+			MousePosition = { SDLC_EventMotionIntX(event), SDLC_EventMotionIntY(event) };
+			gmenu_on_mouse_move();
+		}
 		return;
 	case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		MousePosition = { SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) };
-		HandleMouseButtonDown(event.button.button, modState);
-		return;
 	case SDL_EVENT_MOUSE_BUTTON_UP:
-		MousePosition = { SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) };
-		HandleMouseButtonUp(event.button.button, modState);
+		if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+			// In FP mode, LMB is handled by HandleFirstPersonInput (called above)
+			// and also by the game's normal mouse handler for attack/interact
+			if (event.button.button == SDL_BUTTON_LEFT) {
+				MousePosition = { SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) };
+				if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+					HandleMouseButtonDown(event.button.button, modState);
+				else
+					HandleMouseButtonUp(event.button.button, modState);
+			}
+		} else {
+			MousePosition = { SDLC_EventButtonIntX(event), SDLC_EventButtonIntY(event) };
+			if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+				HandleMouseButtonDown(event.button.button, modState);
+			else
+				HandleMouseButtonUp(event.button.button, modState);
+		}
 		return;
 #if SDL_VERSION_ATLEAST(2, 0, 0)
 	case SDL_EVENT_MOUSE_WHEEL:
@@ -2109,6 +2146,20 @@ void InitKeymapActions()
 	    nullptr,
 	    CaptureScreen);
 	options.Keymapper.AddAction(
+	    "ToggleRenderMode",
+	    N_("Toggle Render Mode"),
+	    N_("Switch between isometric and first-person view."),
+	    SDLK_F6,
+	    [] {
+		    GetOptions().Graphics.renderMode.SetValue(
+		        *GetOptions().Graphics.renderMode == RenderMode::Isometric
+		            ? RenderMode::FirstPerson
+		            : RenderMode::Isometric);
+		    CalcViewportGeometry();
+	    },
+	    nullptr,
+	    CanPlayerTakeAction);
+	options.Keymapper.AddAction(
 	    "GameInfo",
 	    N_("Game info"),
 	    N_("Displays game infos."),
@@ -2620,6 +2671,20 @@ void InitPadmapActions()
 	    ControllerButton_NONE,
 	    nullptr,
 	    CaptureScreen);
+	options.Padmapper.AddAction(
+	    "ToggleRenderMode",
+	    N_("Toggle Render Mode"),
+	    N_("Switch between isometric and first-person view."),
+	    ControllerButton_NONE,
+	    [] {
+		    GetOptions().Graphics.renderMode.SetValue(
+		        *GetOptions().Graphics.renderMode == RenderMode::Isometric
+		            ? RenderMode::FirstPerson
+		            : RenderMode::Isometric);
+		    CalcViewportGeometry();
+	    },
+	    nullptr,
+	    CanPlayerTakeAction);
 	options.Padmapper.AddAction(
 	    "GameInfo",
 	    N_("Game info"),

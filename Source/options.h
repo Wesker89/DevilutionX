@@ -99,6 +99,13 @@ enum class StoreUi : uint8_t {
 	VisualGrid = 2,
 };
 
+enum class RenderMode : uint8_t {
+	/** @brief Original isometric view. */
+	Isometric = 0,
+	/** @brief First-person perspective view. */
+	FirstPerson = 1,
+};
+
 std::string_view ResamplerToString(Resampler resampler);
 std::optional<Resampler> ResamplerFromString(std::string_view resampler);
 
@@ -563,6 +570,8 @@ struct GraphicsOptions : OptionCategoryBase {
 #endif
 	/** @brief Show FPS, even without the -f command line flag. */
 	OptionEntryBoolean showFPS;
+	/** @brief Rendering mode: Isometric or First-Person. */
+	OptionEntryEnum<RenderMode> renderMode;
 };
 
 struct GameplayOptions : OptionCategoryBase {

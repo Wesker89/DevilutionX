@@ -81,6 +81,7 @@ set(libdevilutionx_SRCS
 
   engine/render/automap_render.cpp
   engine/render/scrollrt.cpp
+  engine/render/fp_render.cpp
 
   items/validation.cpp
 

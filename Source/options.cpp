@@ -804,6 +804,11 @@ GraphicsOptions::GraphicsOptions()
     , hardwareCursorMaxSize("Hardware Cursor Maximum Size", OptionEntryFlags::CantChangeInGame | OptionEntryFlags::RecreateUI | (HardwareCursorSupported() ? OptionEntryFlags::None : OptionEntryFlags::Invisible), N_("Hardware Cursor Maximum Size"), N_("Maximum width / height for the hardware cursor. Larger cursors fall back to software."), 128, { 0, 64, 128, 256, 512 })
 #endif
     , showFPS("Show FPS", OptionEntryFlags::None, N_("Show FPS"), N_("Displays the FPS in the upper left corner of the screen."), false)
+    , renderMode("Render Mode", OptionEntryFlags::RecreateUI, N_("Render Mode"), N_("Choose between original isometric view and first-person perspective."), RenderMode::Isometric,
+          {
+              { RenderMode::Isometric, N_("Isometric") },
+              { RenderMode::FirstPerson, N_("First Person") },
+          })
 {
 }
 std::vector<OptionEntryBase *> GraphicsOptions::GetEntries()
@@ -826,6 +831,7 @@ std::vector<OptionEntryBase *> GraphicsOptions::GetEntries()
 		&brightness,
 		&zoom,
 		&showFPS,
+		&renderMode,
 		&perPixelLighting,
 		&colorCycling,
 		&alternateNestArt,

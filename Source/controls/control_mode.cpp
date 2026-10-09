@@ -2,7 +2,7 @@
 
 namespace devilution {
 
-ControlTypes ControlMode = ControlTypes::None;
+ControlTypes ControlMode = ControlTypes::KeyboardAndMouse;
 ControlTypes ControlDevice = ControlTypes::None;
 
 GamepadLayout GamepadType =

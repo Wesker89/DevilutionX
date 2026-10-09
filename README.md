@@ -65,9 +65,85 @@ If you want to help test the latest development version (make sure to back up yo
 [![Nintendo 3DS](https://github.com/diasurgical/devilutionX/actions/workflows/3ds.yml/badge.svg)](https://github.com/diasurgical/devilutionX/actions/workflows/3ds.yml)
 [![Amiga M68K](https://github.com/diasurgical/devilutionX/actions/workflows/amiga-m68k.yml/badge.svg)](https://github.com/diasurgical/devilutionX/actions/workflows/amiga-m68k.yml)
 
+# First-Person Mode Fork
+
+This fork adds a first-person perspective rendering mode to DevilutionX while preserving all original game mechanics.
+
+## Features
+
+- **Toggleable first-person view** - Press **F6** to switch between isometric and first-person modes
+- **Same game simulation** - Player stats, monsters, items, quests, and dungeon state persist across view changes
+- **Configurable** - Render mode saved in `diablo.ini`, accessible in settings menu
+- **Gamepad support** - Configurable button binding via padmapper
+
+## Controls (First-Person Mode)
+
+| Key | Action |
+|-----|--------|
+| **F6** | Toggle render mode (Isometric ↔ First-Person) |
+| **W** | Move forward (sends walk command in view direction) |
+| **S** | Move backward |
+| **A** | Strafe left |
+| **D** | Strafe right |
+| **Mouse** | **Always-on mouselook** (FPS-style camera rotation) |
+| **TAB** | Toggle automap |
+| **SPACE / LCTRL** | Up / Down |
+| **LMB** | Attack / Interact (uses Diablo's combat system) |
+
+## Milestone Progress
+
+- ✅ **Milestone 1**: Repository assessment complete
+- ✅ **Milestone 2**: Rendering mode toggle implemented (F6, config, stub renderer)
+- ✅ **Milestone 3**: First-person prototype complete
+  - ✅ Camera system (position, yaw/pitch, WASD movement, mouse look)
+  - ✅ Raycasting-based dungeon renderer (floor/ceiling/walls from tile data)
+  - ✅ Collision detection with dungeon walls
+  - ✅ **Textured walls** (extracts vertical wall strips from dungeon CEL trapezoid tiles via `SampleDungeonTexture(isWall=true)`)
+  - ✅ **Textured floors** (perspective-correct floor texture mapping with tiling from CEL rectangle parts)
+  - ✅ **Ceiling rendering** (distance-faded with subtle pattern)
+  - ✅ **Proper CLX sprite rendering** (on-the-fly RLE decode → scale blit via `DrawScaledSprite()`)
+  - ✅ **Wall/floor texture separation** (uses `isWall` parameter to extract vertical wall strips vs. floor tiles from trapezoid CEL frames)
+  - ✅ Lighting adaptation (using existing light tables on walls/floor/sprites)
+  - ✅ Sprite billboarding (monsters, players, items via `RenderSprites()`)
+  - ✅ **FPS-style mouselook** (always-on via relative mouse mode, **inverted pitch**)
+- 🔄 **Milestone 4**: Gameplay integration (in progress)
+  - ✅ **Crosshair targeting** (`UpdateCrosshairTarget()` - sets `cursPosition`, `pcursmonst`, `pcursitem`, `ObjectUnderCursor`)
+  - ✅ **Crosshair display** (`DrawCrosshair()` - centered reticle, color-coded by target type)
+  - ✅ **LMB interaction** (`HandleFirstPersonInput()` → `PerformPrimaryAction()`)
+  - ✅ **Door interaction** (distance-checked, opens/closes via `PerformPrimaryAction()`)
+  - ✅ **Targeting feedback** (crosshair color changes, debug text shows target + distance)
+  - ✅ **WASD movement** (camera-relative, sends `CMD_WALKXY` commands via `SendFPWalkCommand()`)
+  - 🔄 Melee/ranged combat integration
+  - 🔄 Spell casting integration
+- ⏳ **Milestone 5**: Polish & compatibility
+
 # Building from Source
 
-Want to compile the program by yourself? Great! Simply follow the [build instructions](./docs/building.md).
+Want to compile the program by yourself? Great! Simply follow the [build instructions](./docs/building.md) or use the provided build scripts:
+
+```bash
+# Full release build
+./build.sh release
+
+# Quick incremental build (after code changes)
+./build-quick.sh
+
+# Clean rebuild
+./build.sh clean && ./build.sh release
+```
+
+## Build Scripts
+
+- `build.sh` - Full configure + build (`clean|debug|release`)
+- `build-quick.sh` - Fast incremental build (no re-configure)
+
+## Running
+
+```bash
+cd build
+# Copy game assets (DIABDAT.MPQ, hellfire.mpq, hf*.mpq) here first
+./devilutionx
+```
 
 # Credits
 

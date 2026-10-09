@@ -33,6 +33,7 @@
 #include "engine/point.hpp"
 #include "engine/render/clx_render.hpp"
 #include "engine/render/dun_render.hpp"
+#include "engine/render/fp_render.hpp"
 #include "engine/render/light_render.hpp"
 #include "engine/render/text_render.hpp"
 #include "engine/trn.hpp"
@@ -1312,6 +1313,18 @@ void DrawGame(const Surface &fullOut, Point position, Displacement offset)
  */
 void DrawView(const Surface &out, Point startPosition)
 {
+	if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+		DrawFirstPersonView(out, startPosition);
+		return;
+	}
+
+	// Disable relative mouse mode when switching back to isometric
+	static bool wasInFPMode = false;
+	if (wasInFPMode) {
+		SDL_SetRelativeMouseMode(SDL_FALSE);
+		wasInFPMode = false;
+	}
+
 #ifdef _DEBUG
 	DebugCoordsMap.clear();
 #endif
