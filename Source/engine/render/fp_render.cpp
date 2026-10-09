@@ -344,13 +344,9 @@ void InitializeCamera(Point viewPosition) {
         g_camera.yaw = 0.0f; // Facing north initially
         g_camera.pitch = 0.0f;
         g_cameraInitialized = true;
-    } else {
-        // Smoothly interpolate camera to follow player
-        float targetX = static_cast<float>(viewPosition.x) + 0.5f;
-        float targetY = static_cast<float>(viewPosition.y) + 0.5f;
-        g_camera.x += (targetX - g_camera.x) * 0.15f;
-        g_camera.y += (targetY - g_camera.y) * 0.15f;
     }
+    // In FPS mode, the camera is the authoritative position.
+    // Do NOT interpolate toward ViewPosition — that would cancel out movement.
 }
 
 /**
@@ -412,6 +408,10 @@ void UpdateCamera(float deltaTime) {
         !IsWallTile(static_cast<int>(g_camera.x - PLAYER_RADIUS), static_cast<int>(newY + PLAYER_RADIUS))) {
         g_camera.y = newY;
     }
+
+    // Keep ViewPosition in sync with camera so isometric view shows correct location
+    ViewPosition.x = static_cast<int>(g_camera.x);
+    ViewPosition.y = static_cast<int>(g_camera.y);
 }
 
 /**
