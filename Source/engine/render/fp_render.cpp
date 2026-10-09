@@ -19,6 +19,7 @@
 #include "engine/render/dun_render.hpp"
 #include "engine/render/primitive_render.hpp"
 #include "engine/render/text_render.hpp"
+#include "engine/direction.hpp"
 #include "levels/dun_tile.hpp"
 #include "levels/dun_tile_data.hpp"
 #include "levels/gendung.h"
@@ -33,6 +34,7 @@
 #include "player.h"
 #include "quests.h"
 #include "controls/plrctrls.h"
+#include "utils/log.hpp"
 
 namespace devilution {
 
@@ -54,15 +56,34 @@ struct Camera {
     float y = 0.0f;      // World Y position (tile units)
     float yaw = 0.0f;    // Horizontal rotation (radians)
     float pitch = 0.0f;  // Vertical rotation (radians)
-    float height = 1.6f; // Eye height above floor (in tile units)
     bool mouseLookEnabled = true; // FPS-style always-on mouselook
 };
 
 Camera g_camera;
 bool g_cameraInitialized = false;
 
+// Developer-only geometry diagnostic: flat untextured materials.
+// Off by default; toggled with F4. Floors/walls/doors each get a
+// contrasting flat color so layout problems show without texture noise.
+bool g_geoDebug = false;
+
 // FPS mouse look state
 bool g_relativeMouseMode = false;
+
+// Per-frame texture diagnostics: textured vs. fallback pixels.
+// Reported periodically via LogInfo and the on-screen debug line so a
+// missing-asset problem can be told apart from a mapping problem.
+uint64_t g_diagWallTex = 0;
+uint64_t g_diagWallFallback = 0;
+uint64_t g_diagFloorTex = 0;
+uint64_t g_diagFloorFallback = 0;
+// Most recent material selections (tile coords + asset frame), so the log
+// shows exactly which original graphics are mapped to visible surfaces.
+Point g_lastWallTile { -1, -1 };
+int g_lastWallFrame = 0;
+int g_lastWallPiece = 0;
+Point g_lastFloorTile { -1, -1 };
+int g_lastFloorFrame = 0;
 
 // Rendering constants
 constexpr float FOV = 90.0f * M_PI / 180.0f;  // 90 degree field of view
@@ -78,88 +99,92 @@ constexpr int DUNGEON_HEIGHT = MAXDUNY;
 constexpr float WALL_HEIGHT = 2.5f;
 constexpr float CEILING_HEIGHT = WALL_HEIGHT;
 
-// Texture mapping
-constexpr int TEXTURE_SIZE = 64;
+// Eye height above the floor in tile units. The floor caster assumes
+// this (rowDistance = EYE_HEIGHT * screenHeight / p), so the wall
+// framing below must use the same value or floors and walls separate.
+constexpr float EYE_HEIGHT = 0.5f;
+
+// Texture mapping (dungeon frames are DunFrameWidth wide)
+constexpr int TEXTURE_SIZE = DunFrameWidth;
+
+/**
+ * Row width of a reencoded triangle frame row, indexed bottom-up (0 = bottom).
+ * Rows 0..15 grow 2,4,...,32; rows 16..30 shrink 30,28,...,2.
+ */
+DVL_ALWAYS_INLINE int TriangleRowWidth(int row)
+{
+	return row < 16 ? 2 * (row + 1) : 2 * (31 - row);
+}
+
+/**
+ * Byte offset of a reencoded triangle frame row, indexed bottom-up.
+ * Lower rows: 0,2,6,12,... (triangular numbers * 2); upper rows follow at offset 272.
+ */
+DVL_ALWAYS_INLINE int TriangleRowOffset(int row)
+{
+	if (row < 16)
+		return row * (row + 1);
+	const int k = row - 16;
+	return 272 + k * (31 - k);
+}
 
 /**
  * Sample a pixel from a dungeon CEL frame at UV coordinates.
- * Handles different tile types (Square, TransparentSquare, Left/RightTrapezoid).
+ * Frame geometry follows dun_tile.hpp / dun_render.cpp:
+ * - Square: flat 32x32 array, row 0 at the bottom.
+ * - Left/RightTriangle: 31 rows bottom-up, widths 2..32..2 (512 bytes total).
+ * - Left/RightTrapezoid: triangle rows 0..15 then a flat 32x16 rectangle (784 bytes).
+ * Coordinates outside a triangle row are clamped into the row so sampling
+ * never reads out of bounds and never leaves holes.
  * @param frameData Raw frame data from GetDunFrame
  * @param tileType Type of tile
  * @param u Horizontal coordinate [0, 1]
- * @param v Vertical coordinate [0, 1]
+ * @param v Vertical coordinate [0, 1] (0 = bottom of the frame)
  * @return Palette color index (0-255)
  */
-uint8_t SampleDungeonTexture(const uint8_t *frameData, TileType tileType, float u, float v, bool isWall = false) {
+uint8_t SampleDungeonTexture(const uint8_t *frameData, TileType tileType, float u, float v) {
     if (frameData == nullptr)
         return 0;
 
     u = std::clamp(u, 0.0f, 1.0f);
     v = std::clamp(v, 0.0f, 1.0f);
 
-    int texX = static_cast<int>(u * (TEXTURE_SIZE - 1));
-    int texY = static_cast<int>(v * (TEXTURE_SIZE - 1));
-
     switch (tileType) {
     case TileType::Square: {
-        // Simple 64x32 array (but we treat as 64x64 for TEXTURE_SIZE)
-        int srcY = std::min(texY, static_cast<int>(DunFrameHeight) - 1);
-        return frameData[srcY * DunFrameWidth + texX];
+        const int texX = std::min(static_cast<int>(u * DunFrameWidth), static_cast<int>(DunFrameWidth) - 1);
+        const int texY = std::min(static_cast<int>(v * DunFrameHeight), static_cast<int>(DunFrameHeight) - 1);
+        return frameData[texY * DunFrameWidth + texX];
     }
     case TileType::TransparentSquare: {
-        // RLE encoded - decode on the fly (simplified: use fallback)
-        // For now, return a color based on position
-        return static_cast<uint8_t>(64 + (texX + texY) % 128);
+        // RLE encoded; no direct sampling. Caller falls back to a base color.
+        return 0;
     }
-    case TileType::LeftTrapezoid: {
-        // Bottom 16 rows: triangle (LeftTriangle encoding)
-        // Top 16 rows: rectangle (64x16)
-        if (texY < 16) {
-            // Triangle part - similar to LeftTriangle
-            int row = 15 - texY; // Bottom-up
-            int width = (row + 1) * 2; // 2, 4, 6, ..., 32
-            int startX = (TEXTURE_SIZE - width) / 2;
-            if (texX < startX || texX >= startX + width)
-                return 0; // Transparent
-            int srcX = texX - startX;
-            int srcOffset = (row * (row + 1)) + srcX; // Simplified triangle indexing
-            return frameData[srcOffset % (ReencodedTrapezoidFrameSize)];
-        } else {
-            // Rectangle part (top 16 rows)
-            int rectY = texY - 16;
-            int srcOffset = ReencodedTrapezoidFrameSize - (16 * TEXTURE_SIZE) + rectY * TEXTURE_SIZE + texX;
-            return frameData[srcOffset];
-        }
-    }
+    case TileType::LeftTrapezoid:
     case TileType::RightTrapezoid: {
-        // Mirror of LeftTrapezoid
+        const int texY = std::min(static_cast<int>(v * DunFrameHeight), static_cast<int>(DunFrameHeight) - 1);
         if (texY < 16) {
-            int row = 15 - texY;
-            int width = (row + 1) * 2;
-            int startX = (TEXTURE_SIZE - width) / 2;
-            if (texX < startX || texX >= startX + width)
-                return 0;
-            int srcX = texX - startX;
-            int srcOffset = (row * (row + 1)) + srcX;
-            return frameData[srcOffset % (ReencodedTrapezoidFrameSize)];
-        } else {
-            int rectY = texY - 16;
-            int srcOffset = ReencodedTrapezoidFrameSize - (16 * TEXTURE_SIZE) + rectY * TEXTURE_SIZE + texX;
-            return frameData[srcOffset];
+            // Triangle part: reuses lower triangle rows 0..15.
+            // Rows are right-aligned by the renderer (RenderTriangleLower
+            // starts at the right edge and extends left), so srcX=0 is the
+            // east end of the row; mirror u for left-pointing frames.
+            const bool mirror = (tileType == TileType::LeftTrapezoid);
+            const int width = TriangleRowWidth(texY);
+            const int rawX = std::min(static_cast<int>(u * width), width - 1);
+            const int texX = mirror ? (width - 1 - rawX) : rawX;
+            return frameData[TriangleRowOffset(texY) + texX];
         }
+        // Rectangle part: flat 32x16 block after the 272 triangle bytes.
+        const int texX = std::min(static_cast<int>(u * DunFrameWidth), static_cast<int>(DunFrameWidth) - 1);
+        return frameData[272 + (texY - 16) * DunFrameWidth + texX];
     }
     case TileType::LeftTriangle:
     case TileType::RightTriangle: {
-        // Triangle encoding - 31 rows of varying width
-        int row = std::min(texY, static_cast<int>(DunFrameTriangleHeight) - 1);
-        int width = (row < 16) ? (row + 1) * 2 : (31 - row) * 2;
-        int startX = (TEXTURE_SIZE - width) / 2;
-        if (texX < startX || texX >= startX + width)
-            return 0;
-        int srcX = texX - startX;
-        // Simplified triangle indexing
-        int srcOffset = (row * (row + 1) / 2) * 2 + srcX;
-        return frameData[srcOffset % ReencodedTriangleFrameSize];
+        const int row = std::min(static_cast<int>(v * DunFrameTriangleHeight), static_cast<int>(DunFrameTriangleHeight) - 1);
+        const int width = TriangleRowWidth(row);
+        const int rawX = std::min(static_cast<int>(u * width), width - 1);
+        // Left triangles are right-aligned by the renderer (see above).
+        const int texX = (tileType == TileType::LeftTriangle) ? (width - 1 - rawX) : rawX;
+        return frameData[TriangleRowOffset(row) + texX];
     }
     default:
         return 0;
@@ -191,6 +216,9 @@ struct InputState {
 constexpr float MOVE_SPEED = 5.0f;
 constexpr float TURN_SPEED = 2.0f; // radians per second
 
+// Mouse look sensitivity (radians per mouse-motion unit)
+constexpr float MOUSE_SENSITIVITY = 0.005f;
+
 // Raycast result
 struct RayHit {
     float distance = FAR_PLANE;
@@ -203,6 +231,7 @@ struct RayHit {
     float textureX = 0.0f;
     int lightTableIndex = 0;
     TileType tileType = TileType::Square;
+    uint16_t pieceId = 0; // dPiece id of the hit tile, for wall-stack lookup
 };
 
 /**
@@ -276,8 +305,10 @@ void DrawScaledSprite(const Surface &out, const ClxSprite &sprite, int screenX, 
     // Create a temporary buffer for the decoded sprite
     std::vector<uint8_t> tempBuffer(srcWidth * srcHeight, 0);
 
-    // Decode the CLX sprite to the temp buffer (bottom-up, like the renderer does)
-    // CLX uses CL2-style RLE encoding
+    // Decode the CLX sprite to the temp buffer (bottom-up, like the renderer does).
+    // CLX encoding (see utils/clx_decode.hpp): control >= 0x80 is OPAQUE
+    // (fill run of 0xBF-control pixels if control <= 0xBE, else literal run
+    // of -control pixels); control < 0x80 is a TRANSPARENT run of pixels.
     const uint8_t *src = spriteData;
     const uint8_t *srcEnd = src + spriteDataSize;
 
@@ -286,22 +317,24 @@ void DrawScaledSprite(const Surface &out, const ClxSprite &sprite, int screenX, 
         int x = 0;
         while (x < srcWidth && src < srcEnd) {
             uint8_t control = *src++;
-            if (control >= 0xC0) { // Transparent run (0xC0-0xFF)
-                int run = 0x100 - control;
-                x += run;
-                if (x > srcWidth) break;
-            } else if (control >= 0x80) { // Fill run (0x80-0xBF)
-                int run = control - 0x80 + 1;
-                uint8_t color = *src++;
-                for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
-                    tempBuffer[y * srcWidth + x] = color;
-                }
-            } else { // Literal run (0x00-0x7F)
-                int run = control + 1;
-                for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
+            if (control >= 0x80) { // Opaque
+                if (control <= 0xBE) { // Fill run
+                    const int run = 0xBF - control;
                     if (src >= srcEnd) break;
-                    tempBuffer[y * srcWidth + x] = *src++;
+                    const uint8_t color = *src++;
+                    for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
+                        tempBuffer[y * srcWidth + x] = color;
+                    }
+                } else { // Literal pixels
+                    int run = 256 - control;
+                    for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
+                        if (src >= srcEnd) break;
+                        tempBuffer[y * srcWidth + x] = *src++;
+                    }
                 }
+            } else { // Transparent run
+                x += control;
+                if (x > srcWidth) break;
             }
         }
     }
@@ -335,6 +368,38 @@ void DrawScaledSprite(const Surface &out, const ClxSprite &sprite, int screenX, 
 }
 
 /**
+ * Place the camera at the center of the given tile, nudging to the
+ * nearest walkable tile when the target itself is not walkable.
+ * Uses the game's own walkability rules (solid tiles, objects, doors).
+ */
+void SnapCameraToTile(Point tile)
+{
+    Point placed = tile;
+    if (!InDungeonBounds(placed) || !IsTileWalkable(placed)) {
+        bool found = false;
+        for (int radius = 1; radius <= 8 && !found; radius++) {
+            for (int dy = -radius; dy <= radius && !found; dy++) {
+                for (int dx = -radius; dx <= radius && !found; dx++) {
+                    if (std::max(std::abs(dx), std::abs(dy)) != radius)
+                        continue;
+                    const Point candidate { tile.x + dx, tile.y + dy };
+                    if (InDungeonBounds(candidate) && IsTileWalkable(candidate)) {
+                        placed = candidate;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if (!found)
+            return; // Nowhere valid nearby; keep the current camera position.
+    }
+    g_camera.x = static_cast<float>(placed.x) + 0.5f;
+    g_camera.y = static_cast<float>(placed.y) + 0.5f;
+    g_input.mouseDeltaX = 0.0f;
+    g_input.mouseDeltaY = 0.0f;
+}
+
+/**
  * Initialize camera from ViewPosition
  */
 void InitializeCamera(Point viewPosition) {
@@ -350,12 +415,19 @@ void InitializeCamera(Point viewPosition) {
 }
 
 /**
- * Update camera based on input
+ * Update camera based on input.
+ *
+ * The camera is render-only state: orientation comes from the mouse and
+ * the position follows the authoritative player tile. Movement itself is
+ * performed by the game simulation via CMD_WALKXY walk commands issued
+ * from ProcessFPInput, so collision, doors, multiplayer sync, occupancy
+ * (dPlayer), lighting/vision and ViewPosition all stay authoritative.
+ * This function must not write simulation state.
  */
 void UpdateCamera(float deltaTime) {
-    // Rotation
-    g_camera.yaw += g_input.mouseDeltaX * TURN_SPEED * deltaTime;
-    g_camera.pitch = std::clamp(g_camera.pitch - g_input.mouseDeltaY * TURN_SPEED * deltaTime, -static_cast<float>(M_PI) / 2.5f, static_cast<float>(M_PI) / 2.5f);
+    // Rotation (mouse delta is already in radians, don't multiply by deltaTime)
+    g_camera.yaw += g_input.mouseDeltaX;
+    g_camera.pitch = std::clamp(g_camera.pitch - g_input.mouseDeltaY, -static_cast<float>(M_PI) / 2.5f, static_cast<float>(M_PI) / 2.5f);
     g_input.mouseDeltaX = 0.0f;
     g_input.mouseDeltaY = 0.0f;
 
@@ -363,55 +435,24 @@ void UpdateCamera(float deltaTime) {
     while (g_camera.yaw > M_PI) g_camera.yaw -= 2.0f * M_PI;
     while (g_camera.yaw < -M_PI) g_camera.yaw += 2.0f * M_PI;
 
-    // Movement
-    float cosYaw = std::cos(g_camera.yaw);
-    float sinYaw = std::sin(g_camera.yaw);
-    float moveX = 0.0f;
-    float moveY = 0.0f;
+    if (MyPlayer == nullptr)
+        return;
 
-    if (g_input.forward) {
-        moveX += sinYaw;
-        moveY -= cosYaw;
+    // Follow the authoritative player position (tile center), smoothed so
+    // tile steps glide instead of snapping. Snap when far away
+    // (teleports, level changes, or first entry).
+    const float targetX = static_cast<float>(MyPlayer->position.tile.x) + 0.5f;
+    const float targetY = static_cast<float>(MyPlayer->position.tile.y) + 0.5f;
+    const float dx = targetX - g_camera.x;
+    const float dy = targetY - g_camera.y;
+    if (dx * dx + dy * dy > 2.25f) { // > 1.5 tiles: snap
+        g_camera.x = targetX;
+        g_camera.y = targetY;
+    } else {
+        const float follow = std::min(1.0f, deltaTime * 10.0f);
+        g_camera.x += dx * follow;
+        g_camera.y += dy * follow;
     }
-    if (g_input.backward) {
-        moveX -= sinYaw;
-        moveY += cosYaw;
-    }
-    if (g_input.strafeLeft) {
-        moveX -= cosYaw;
-        moveY -= sinYaw;
-    }
-    if (g_input.strafeRight) {
-        moveX += cosYaw;
-        moveY += sinYaw;
-    }
-
-    float speed = MOVE_SPEED * deltaTime;
-    float newX = g_camera.x + moveX * speed;
-    float newY = g_camera.y + moveY * speed;
-
-    // Collision detection - simple AABB vs tile grid
-    constexpr float PLAYER_RADIUS = 0.3f;
-
-    // Check X movement
-    if (!IsWallTile(static_cast<int>(newX - PLAYER_RADIUS), static_cast<int>(g_camera.y + PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(newX + PLAYER_RADIUS), static_cast<int>(g_camera.y + PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(newX - PLAYER_RADIUS), static_cast<int>(g_camera.y - PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(newX + PLAYER_RADIUS), static_cast<int>(g_camera.y - PLAYER_RADIUS))) {
-        g_camera.x = newX;
-    }
-
-    // Check Y movement
-    if (!IsWallTile(static_cast<int>(g_camera.x + PLAYER_RADIUS), static_cast<int>(newY - PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(g_camera.x + PLAYER_RADIUS), static_cast<int>(newY + PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(g_camera.x - PLAYER_RADIUS), static_cast<int>(newY - PLAYER_RADIUS)) &&
-        !IsWallTile(static_cast<int>(g_camera.x - PLAYER_RADIUS), static_cast<int>(newY + PLAYER_RADIUS))) {
-        g_camera.y = newY;
-    }
-
-    // Keep ViewPosition in sync with camera so isometric view shows correct location
-    ViewPosition.x = static_cast<int>(g_camera.x);
-    ViewPosition.y = static_cast<int>(g_camera.y);
 }
 
 /**
@@ -485,7 +526,8 @@ RayHit CastRay(float rayAngle) {
             // Get texture from dungeon data
             if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT) {
                 uint16_t pieceId = dPiece[mapX][mapY];
-                if (pieceId > 0 && pieceId < sizeof(DPieceMicros) / sizeof(DPieceMicros[0])) {
+                if (pieceId > 0 && pieceId < MAXTILES) {
+                    hit.pieceId = pieceId;
                     // Use first micro tile for texture
                     LevelCelBlock block = { DPieceMicros[pieceId].mt[0] };
                     if (block.hasValue()) {
@@ -511,11 +553,13 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
     // Correct for fisheye effect
     float correctedDist = hit.distance * std::cos(g_camera.yaw - (g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV));
 
-    // Calculate wall height on screen
-    float wallHeightOnScreen = (screenHeight / correctedDist) * (WALL_HEIGHT / 2.0f);
-
-    int drawStart = static_cast<int>(screenHeight / 2 - wallHeightOnScreen / 2 + g_camera.pitch * screenHeight);
-    int drawEnd = static_cast<int>(screenHeight / 2 + wallHeightOnScreen / 2 + g_camera.pitch * screenHeight);
+    // Calculate wall height on screen.
+    // The wall spans world heights [0, WALL_HEIGHT]; the eye sits
+    // EYE_HEIGHT above the floor, so the base projects EYE_HEIGHT/dist
+    // below the horizon and the top (WALL_HEIGHT - EYE_HEIGHT)/dist above.
+    // This matches the floor caster, so wall bases meet floors exactly.
+    int drawStart = static_cast<int>(screenHeight / 2 - ((WALL_HEIGHT - EYE_HEIGHT) / correctedDist) * screenHeight + g_camera.pitch * screenHeight);
+    int drawEnd = static_cast<int>(screenHeight / 2 + (EYE_HEIGHT / correctedDist) * screenHeight + g_camera.pitch * screenHeight);
 
     drawStart = std::max(0, drawStart);
     drawEnd = std::min(screenHeight - 1, drawEnd);
@@ -528,28 +572,83 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
         ? LightTables[hit.lightTableIndex].data()
         : LightTables[0].data();
 
-    // Get frame data for this tile
-    const uint8_t *frameData = nullptr;
-    if (hit.textureId > 0) {
-        frameData = GetDunFrame(pDungeonCels.get(), hit.textureId);
-    }
+    // Wall art lives in the micro-tile stack above the floor pair:
+    // mt[0],mt[1] = floor triangles, mt[2..MicroTileLen) = wall layers
+    // (left/right frame pairs going upward, like DrawCell in scrollrt.cpp).
+    const int numLayers = MicroTileLen > 2 ? (static_cast<int>(MicroTileLen) - 2) / 2 : 0;
 
     // Draw vertical line with texture sampling
     for (int y = drawStart; y <= drawEnd; ++y) {
         float v = (y - drawStart) / static_cast<float>(drawEnd - drawStart);
         float u = hit.textureX;
 
-        // Sample texture from dungeon CEL data
-        uint8_t color;
-        if (frameData != nullptr) {
-            color = SampleDungeonTexture(frameData, hit.tileType, u, v, true);
-        } else {
-            // Fallback color
-            color = GetWallBaseColor(hit.textureId, hit.hitDoor);
+        // Select the wall layer frame for this height.
+        // v = 0 at the top of the wall column, v = 1 at the base.
+        // mt[2] is the bottom layer, so the top of the screen maps to
+        // the topmost layer. Each layer is authored as a left/right frame
+        // PAIR drawn side-by-side by DrawCell — but real MIN data shows
+        // the odd slot is often empty (e.g. L1 pieces 0, 2, 12), in which
+        // case the single frame spans the whole face (mirrored on the
+        // right half so texel density and the center seam stay clean)
+        // instead of falling back to a flat color for half the wall.
+        const uint8_t *frameData = nullptr;
+        TileType frameType = hit.tileType;
+        int frameId = hit.textureId;
+        if (hit.pieceId > 0 && numLayers > 0) {
+            const float h = v * numLayers;
+            const int layerFromTop = std::min(static_cast<int>(h), numLayers - 1);
+            const int layerFromBottom = numLayers - 1 - layerFromTop;
+            const float subV = 1.0f - (h - static_cast<float>(layerFromTop)); // 1 at layer top
+            const LevelCelBlock leftBlock { DPieceMicros[hit.pieceId].mt[2 + 2 * layerFromBottom] };
+            const LevelCelBlock rightBlock { DPieceMicros[hit.pieceId].mt[2 + 2 * layerFromBottom + 1] };
+            const bool leftOk = leftBlock.hasValue() && leftBlock.type() != TileType::TransparentSquare;
+            const bool rightOk = rightBlock.hasValue() && rightBlock.type() != TileType::TransparentSquare;
+            const bool rightHalf = u >= 0.5f;
+            if (leftOk && rightOk) {
+                const LevelCelBlock &wallBlock = rightHalf ? rightBlock : leftBlock;
+                frameId = wallBlock.frame();
+                frameType = wallBlock.type();
+                frameData = GetDunFrame(pDungeonCels.get(), frameId);
+                v = std::clamp(subV, 0.0f, 1.0f);
+                u = std::clamp(rightHalf ? (u - 0.5f) * 2.0f : u * 2.0f, 0.0f, 1.0f);
+            } else if (leftOk || rightOk) {
+                const LevelCelBlock &wallBlock = leftOk ? leftBlock : rightBlock;
+                frameId = wallBlock.frame();
+                frameType = wallBlock.type();
+                frameData = GetDunFrame(pDungeonCels.get(), frameId);
+                v = std::clamp(subV, 0.0f, 1.0f);
+                // Mirror across the middle so the seam is continuous.
+                u = std::clamp(rightHalf ? 1.0f - (u - 0.5f) * 2.0f : u * 2.0f, 0.0f, 1.0f);
+            }
+        }
+        if (frameData == nullptr && hit.textureId > 0) {
+            frameData = GetDunFrame(pDungeonCels.get(), hit.textureId);
         }
 
-        // Vertical gradient (darker at top/bottom)
-        color = static_cast<uint8_t>(color * (0.5f + 0.5f * std::sin(v * M_PI)));
+        // Sample texture from dungeon CEL data
+        uint8_t color;
+        if (g_geoDebug) {
+            // Geometry-only diagnostic: flat color per wall orientation.
+            // Door tiles (real door objects, not dSpecial arches) read green.
+            // No textures, no lighting.
+            const Object *wallObj = FindObjectAtPosition({ hit.tileX, hit.tileY });
+            if (wallObj != nullptr && wallObj->isDoor())
+                color = 180;
+            else if (hit.side == 0)
+                color = 200;
+            else
+                color = 150;
+        } else if (frameData != nullptr && frameType != TileType::TransparentSquare) {
+            color = SampleDungeonTexture(frameData, frameType, u, v);
+            g_diagWallTex++;
+            g_lastWallTile = { hit.tileX, hit.tileY };
+            g_lastWallFrame = frameId;
+            g_lastWallPiece = hit.pieceId;
+        } else {
+            // Fallback color
+            color = GetWallBaseColor(frameId, hit.hitDoor);
+            g_diagWallFallback++;
+        }
 
         // Apply lighting
         if (lightTable != nullptr) {
@@ -569,51 +668,104 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
 }
 
 /**
+ * Sample the floor art for a world position.
+ * Floors are the mt[0]/mt[1] triangle pair of the tile's piece.
+ * Like DrawFloorTile in scrollrt.cpp, the frames are always interpreted
+ * as Left/RightTriangle art regardless of the MIN-declared block type,
+ * because several floor pieces declare a Square type over triangle data
+ * (sampling those as squares reads out of bounds and shows garbage).
+ * The left triangle covers the left half of the tile square, the right
+ * triangle the right half. Returns 0 when no usable art exists.
+ */
+uint8_t SampleFloorAt(float worldX, float worldY, int *outLightTableIndex)
+{
+    const int tileX = static_cast<int>(std::floor(worldX));
+    const int tileY = static_cast<int>(std::floor(worldY));
+    if (outLightTableIndex != nullptr)
+        *outLightTableIndex = 0;
+    if (tileX < 0 || tileX >= DUNGEON_WIDTH || tileY < 0 || tileY >= DUNGEON_HEIGHT)
+        return 0;
+    const uint16_t pieceId = dPiece[tileX][tileY];
+    if (pieceId == 0 || pieceId >= MAXTILES)
+        return 0;
+    if (outLightTableIndex != nullptr)
+        *outLightTableIndex = dLight[tileX][tileY];
+
+    const float fracX = worldX - std::floor(worldX);
+    const float fracY = worldY - std::floor(worldY);
+    // Left triangle covers the left half of the tile, right triangle the right half.
+    const bool leftHalf = fracX < 0.5f;
+    const LevelCelBlock floorBlock { DPieceMicros[pieceId].mt[leftHalf ? 0 : 1] };
+    if (!floorBlock.hasValue() || floorBlock.type() == TileType::TransparentSquare)
+        return 0;
+    const float u = leftHalf ? fracX * 2.0f : (fracX - 0.5f) * 2.0f;
+    // Triangle row 0 is the south tip of the isometric diamond, which sits
+    // at the south edge of the top-down tile square (fracY = 1).
+    const float v = 1.0f - fracY;
+    const TileType triType = leftHalf ? TileType::LeftTriangle : TileType::RightTriangle;
+    g_lastFloorTile = { tileX, tileY };
+    g_lastFloorFrame = floorBlock.frame();
+    return SampleDungeonTexture(GetDunFrame(pDungeonCels.get(), floorBlock.frame()), triType, u, v);
+}
+
+/**
  * Draw floor and ceiling with textured rendering
  */
 void DrawFloorCeiling(const Surface &out, int screenX, const RayHit &hit, int screenWidth, int screenHeight) {
     int horizon = screenHeight / 2 + static_cast<int>(g_camera.pitch * screenHeight);
 
-    // Get the tile we're standing on for floor texture
-    int mapX = static_cast<int>(g_camera.x);
-    int mapY = static_cast<int>(g_camera.y);
-
-    // Pre-fetch floor and ceiling textures for the current tile
-    const uint8_t *floorFrameData = nullptr;
-    TileType floorTileType = TileType::Square;
-    const uint8_t *ceilFrameData = nullptr;
-    TileType ceilTileType = TileType::Square;
-
-    if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT) {
-        uint16_t pieceId = dPiece[mapX][mapY];
-        if (pieceId > 0 && pieceId < sizeof(DPieceMicros) / sizeof(DPieceMicros[0])) {
-            // Get floor texture (first micro tile is typically the floor)
-            LevelCelBlock floorBlock = { DPieceMicros[pieceId].mt[0] };
-            if (floorBlock.hasValue()) {
-                floorFrameData = GetDunFrame(pDungeonCels.get(), floorBlock.frame());
-                floorTileType = floorBlock.type();
-            }
-
-            // For ceiling, use a generic ceiling texture or derive from wall
-            // For now, use a simple ceiling texture
-            ceilFrameData = nullptr; // Will use fallback
-        }
-    }
-
-    // Light table for current position
-    int lightIdx = GetTileLight(mapX, mapY);
-    const uint8_t *lightTable = (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
-        ? LightTables[lightIdx].data()
-        : LightTables[0].data();
+    // Light table fallback (per-pixel tables override this below)
+    const uint8_t *cameraLightTable = LightTables[0].data();
 
     for (int y = 0; y < screenHeight; ++y) {
         uint8_t color = 0;
+        const uint8_t *lightTable = cameraLightTable;
+
+        if (g_geoDebug) {
+            // Geometry-only diagnostic: flat colors, no textures/lighting.
+            // Walkable floor = neutral gray, solid = dark, out of bounds =
+            // black, door tiles = green, ceiling = near-black.
+            float p = (y < horizon) ? (horizon - y) : (y - screenHeight / 2 - g_camera.pitch * screenHeight);
+            if (p == 0) p = 1;
+            const float rowDistance = (EYE_HEIGHT * screenHeight) / p;
+            const float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
+            const float wx = g_camera.x + std::sin(rayAngle) * rowDistance;
+            const float wy = g_camera.y - std::cos(rayAngle) * rowDistance;
+            if (y < horizon) {
+                color = 8;
+            } else {
+                const Point tile { static_cast<int>(std::floor(wx)), static_cast<int>(std::floor(wy)) };
+                if (!InDungeonBounds(tile)) {
+                    color = 0;
+                } else {
+                    const Object *obj = FindObjectAtPosition(tile);
+                    if (obj != nullptr && obj->isDoor()) {
+                        color = 180;
+                    } else if (IsTileWalkable(tile)) {
+                        color = 96;
+                    } else {
+                        color = 16;
+                    }
+                    // Tile-grid overlay: brighten pixels near tile borders
+                    // so alignment, corners and doorways can be inspected.
+                    const float fx = wx - std::floor(wx);
+                    const float fy = wy - std::floor(wy);
+                    if (fx < 0.04f || fx > 0.96f || fy < 0.04f || fy > 0.96f) {
+                        color = 200;
+                    }
+                }
+            }
+            *out.at(screenX, y) = color;
+            continue;
+        }
 
         if (y < horizon) {
-            // Ceiling rendering
+            // Ceiling rendering.
+            // The original game has no ceiling art, so this stays a dark
+            // procedural placeholder until a later milestone.
             float p = horizon - y;
             if (p == 0) p = 1;
-            float posZ = 0.5f * screenHeight;
+            float posZ = EYE_HEIGHT * screenHeight;
             float rowDistance = posZ / p;
 
             // Calculate world position for this ceiling pixel
@@ -637,7 +789,7 @@ void DrawFloorCeiling(const Surface &out, int screenX, const RayHit &hit, int sc
             // Floor rendering
             float p = y - screenHeight / 2 - g_camera.pitch * screenHeight;
             if (p == 0) continue;
-            float posZ = 0.5f * screenHeight;
+            float posZ = EYE_HEIGHT * screenHeight;
             float rowDistance = posZ / p;
 
             // Calculate world position for this floor pixel
@@ -648,20 +800,19 @@ void DrawFloorCeiling(const Surface &out, int screenX, const RayHit &hit, int sc
             float floorX = g_camera.x + rayDirX * rowDistance;
             float floorY = g_camera.y + rayDirY * rowDistance;
 
-            // Sample floor texture if available
-            if (floorFrameData != nullptr) {
-                // Convert world coordinates to texture coordinates
-                float texU = (floorX - std::floor(floorX)) * 1.0f;
-                float texV = (floorY - std::floor(floorY)) * 1.0f;
-
-                // Clamp to [0, 1]
-                texU = texU - std::floor(texU);
-                texV = texV - std::floor(texV);
-
-                color = SampleDungeonTexture(floorFrameData, floorTileType, texU, texV, false);
+            // Sample the art of the tile under this pixel (per-pixel lookup,
+            // so each tile shows its own floor texture, not the camera tile's).
+            int lightIdx = 0;
+            const uint8_t sampled = SampleFloorAt(floorX, floorY, &lightIdx);
+            if (sampled != 0) {
+                color = sampled;
+                g_diagFloorTex++;
+                if (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
+                    lightTable = LightTables[lightIdx].data();
             } else {
-                // Fallback floor color based on tile
+                // Fallback floor color when the tile has no usable floor art.
                 color = 32;
+                g_diagFloorFallback++;
             }
 
             // Distance fade
@@ -833,11 +984,14 @@ bool ProjectWorldToScreen(float worldX, float worldY, int screenWidth, int scree
     float dx = worldX - g_camera.x;
     float dy = worldY - g_camera.y;
 
-    // Rotate by camera yaw (inverse rotation)
+    // Rotate world offset into camera space.
+    // Camera forward is F = (sin yaw, -cos yaw) and right is
+    // R = (cos yaw, sin yaw), so depth = rel.F, lateral = rel.R.
+    // Depth must be positive ahead of the camera.
     float cosYaw = std::cos(g_camera.yaw);
     float sinYaw = std::sin(g_camera.yaw);
     float rotX = dx * cosYaw + dy * sinYaw;
-    float rotY = -dx * sinYaw + dy * cosYaw;
+    float rotY = dx * sinYaw - dy * cosYaw;
 
     // Check if behind camera
     if (rotY <= 0.1f)  // Small epsilon to avoid division by zero
@@ -852,9 +1006,11 @@ bool ProjectWorldToScreen(float worldX, float worldY, int screenWidth, int scree
 
     outX = static_cast<int>(screenWidth / 2 + (angle / (FOV / 2.0f)) * (screenWidth / 2.0f));
 
-    // Calculate screen Y from vertical angle (pitch)
-    // For now, center vertically with pitch offset
-    outY = static_cast<int>(screenHeight / 2 + g_camera.pitch * screenHeight);
+    // Ground the sprite: project the floor point under the entity so the
+    // billboard base sits on the floor at its distance (eye height above
+    // floor divided by depth), plus the pitch offset.
+    outY = static_cast<int>(screenHeight / 2 + g_camera.pitch * screenHeight
+        + (EYE_HEIGHT / outDistance) * screenHeight);
 
     return true;
 }
@@ -992,16 +1148,59 @@ void SendFPWalkCommand(Direction dir) {
         NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, target);
     }
 }
+/**
+ * Recompute the walk target from the currently held WASD keys and issue
+ * a single-step walk command in the camera-relative direction.
+ * Called on every WASD press/release so combined keys produce diagonals
+ * and releasing a key continues with the remaining held keys.
+ * Skipped when already heading to that tile to avoid command spam from
+ * OS key repeat.
+ */
+void RefreshFPWalkTarget()
+{
+    if (MyPlayer == nullptr)
+        return;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    const float cosYaw = std::cos(g_camera.yaw);
+    const float sinYaw = std::sin(g_camera.yaw);
+    if (g_input.forward) {
+        dx += sinYaw;
+        dy -= cosYaw;
+    }
+    if (g_input.backward) {
+        dx -= sinYaw;
+        dy += cosYaw;
+    }
+    if (g_input.strafeLeft) {
+        dx -= cosYaw;
+        dy -= sinYaw;
+    }
+    if (g_input.strafeRight) {
+        dx += cosYaw;
+        dy += sinYaw;
+    }
+    if (dx == 0.0f && dy == 0.0f)
+        return;
+    const Point from = MyPlayer->position.future;
+    const Point target { from.x + (dx > 0.5f ? 1 : (dx < -0.5f ? -1 : 0)),
+        from.y + (dy > 0.5f ? 1 : (dy < -0.5f ? -1 : 0)) };
+    if (target == from || target == MyPlayer->position.future)
+        return;
+    if (InDungeonBounds(target) && PosOkPlayer(*MyPlayer, target)) {
+        NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, target);
+    }
+}
 void ProcessFPInput(const SDL_Event &event) {
     if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
         bool pressed = (event.type == SDL_KEYDOWN);
         SDL_Keycode key = event.key.keysym.sym;
 
         switch (key) {
-            case SDLK_w: g_input.forward = pressed; break;
-            case SDLK_s: g_input.backward = pressed; break;
-            case SDLK_a: g_input.strafeLeft = pressed; break;
-            case SDLK_d: g_input.strafeRight = pressed; break;
+            case SDLK_w: g_input.forward = pressed; RefreshFPWalkTarget(); break;
+            case SDLK_s: g_input.backward = pressed; RefreshFPWalkTarget(); break;
+            case SDLK_a: g_input.strafeLeft = pressed; RefreshFPWalkTarget(); break;
+            case SDLK_d: g_input.strafeRight = pressed; RefreshFPWalkTarget(); break;
             case SDLK_SPACE: g_input.up = pressed; break;
             case SDLK_LCTRL: g_input.down = pressed; break;
         }
@@ -1010,7 +1209,6 @@ void ProcessFPInput(const SDL_Event &event) {
         // When in relative mode, xrel/yrel are already relative movements
         // Accumulate deltas — multiple MOUSEMOTION events can arrive per frame
         if (g_relativeMouseMode || g_camera.mouseLookEnabled) {
-            constexpr float MOUSE_SENSITIVITY = 0.003f;
             g_input.mouseDeltaX += static_cast<float>(event.motion.xrel) * MOUSE_SENSITIVITY;
             g_input.mouseDeltaY += static_cast<float>(event.motion.yrel) * MOUSE_SENSITIVITY;
         }
@@ -1019,9 +1217,74 @@ void ProcessFPInput(const SDL_Event &event) {
 
 } // namespace
 
+/**
+ * Log FPS texture diagnostics: which frames the renderer resolves and
+ * how many pixels use real art vs. fallback colors.
+ * Distinguishes missing assets / decode failures (fallback dominates,
+ * frame 0, empty wall stacks) from mapping problems (frames resolve
+ * but look wrong on screen).
+ */
+void LogFpTextureStats()
+{
+    std::string playerPiece = "none";
+    std::string wallStack = "none";
+    if (MyPlayer != nullptr) {
+        const Point tile = MyPlayer->position.tile;
+        if (InDungeonBounds(tile)) {
+            const uint16_t pieceId = dPiece[tile.x][tile.y];
+            if (pieceId > 0 && pieceId < MAXTILES) {
+                const LevelCelBlock f0 { DPieceMicros[pieceId].mt[0] };
+                const LevelCelBlock f1 { DPieceMicros[pieceId].mt[1] };
+                playerPiece = "piece " + std::to_string(pieceId)
+                    + " mt0 f" + std::to_string(f0.hasValue() ? f0.frame() : 0)
+                    + "/t" + std::to_string(static_cast<int>(f0.type()))
+                    + " mt1 f" + std::to_string(f1.hasValue() ? f1.frame() : 0)
+                    + "/t" + std::to_string(static_cast<int>(f1.type()));
+                std::string layers;
+                for (int i = 2; i < static_cast<int>(MicroTileLen) && i < 16; i++) {
+                    const LevelCelBlock b { DPieceMicros[pieceId].mt[i] };
+                    layers += (i > 2 ? "," : "") + std::to_string(b.hasValue() ? b.frame() : 0);
+                }
+                wallStack = "mt[2..] frames [" + layers + "]";
+            } else {
+                playerPiece = "piece " + std::to_string(pieceId) + " (invalid)";
+            }
+        }
+    }
+    LogInfo("FPS tex: level {} microLen {} player {} | walls art/fallback {}/{} floors art/fallback {}/{} | last wall tile({},{}) piece {} frame {} last floor tile({},{}) frame {}",
+        static_cast<int>(currlevel), static_cast<int>(MicroTileLen), playerPiece,
+        g_diagWallTex, g_diagWallFallback, g_diagFloorTex, g_diagFloorFallback,
+        g_lastWallTile.x, g_lastWallTile.y, g_lastWallPiece, g_lastWallFrame,
+        g_lastFloorTile.x, g_lastFloorTile.y, g_lastFloorFrame);
+    g_diagWallTex = g_diagWallFallback = g_diagFloorTex = g_diagFloorFallback = 0;
+}
+
 void DrawFirstPersonView(const Surface &out, Point startPosition) {
     // Initialize/update camera
     InitializeCamera(startPosition);
+
+    // If the level changed underneath FPS mode (stairs, portal, load),
+    // the old camera coordinates belong to another map. Reconcile with
+    // the authoritative player position instead of rendering stuck
+    // inside a wall.
+    static uint8_t lastLevel = 0;
+    static bool firstFrame = true;
+    if (firstFrame || currlevel != lastLevel) {
+        firstFrame = false;
+        lastLevel = currlevel;
+        if (MyPlayer != nullptr)
+            SnapCameraToTile(MyPlayer->position.tile);
+        LogFpTextureStats();
+    }
+
+    // Clear any stale mouse deltas from before entering FPS mode
+    // This prevents the camera from jumping on the first frame
+    static bool wasInFPS = false;
+    if (!wasInFPS) {
+        g_input.mouseDeltaX = 0.0f;
+        g_input.mouseDeltaY = 0.0f;
+        wasInFPS = true;
+    }
 
     // Enable relative mouse mode for FPS-style mouselook
     // This is idempotent — SDL_SetRelativeMouseMode(SDL_TRUE) is a no-op if already active
@@ -1058,6 +1321,21 @@ void DrawFirstPersonView(const Surface &out, Point startPosition) {
         Rectangle { Point { 10, 10 }, Size { 400, 16 } },
         { .flags = UiFlags::ColorWhite });
 
+    // Texture diagnostics: textured vs. fallback pixels this session.
+    // If fallbacks dominate, art isn't resolving; if textured dominates
+    // but looks wrong, the mapping is at fault.
+    DrawString(out, "Tex W:" + std::to_string(g_diagWallTex) + "/" + std::to_string(g_diagWallFallback)
+            + " F:" + std::to_string(g_diagFloorTex) + "/" + std::to_string(g_diagFloorFallback),
+        Rectangle { Point { 10, 66 }, Size { 500, 16 } },
+        TextRenderOptions { .flags = UiFlags::ColorBlue });
+
+    // Periodically report to the log (rate-limited).
+    static int framesSinceReport = 0;
+    if (++framesSinceReport >= 600) {
+        framesSinceReport = 0;
+        LogFpTextureStats();
+    }
+
     // Show what we're targeting
     std::string targetInfo = "Target: ";
     if (pcursmonst != -1) {
@@ -1085,6 +1363,23 @@ void DrawFirstPersonView(const Surface &out, Point startPosition) {
     DrawString(out, "WASD=Move | Mouse=Look | F6=Toggle | LMB=Interact",
         Rectangle { Point { 10, 30 }, Size { 500, 16 } },
         { .flags = UiFlags::ColorYellow });
+
+    if (g_geoDebug && MyPlayer != nullptr) {
+        // Geometry inspector: exact tile/piece under the camera and the
+        // crosshair, so a broken-looking spot can be reported precisely.
+        const Point camTile { static_cast<int>(g_camera.x), static_cast<int>(g_camera.y) };
+        const uint16_t camPiece = InDungeonBounds(camTile) ? dPiece[camTile.x][camTile.y] : 0;
+        std::string geoInfo = "cam(" + std::to_string(camTile.x) + "," + std::to_string(camTile.y)
+            + ")p" + std::to_string(camPiece)
+            + " hit(" + std::to_string(cursPosition.x) + "," + std::to_string(cursPosition.y) + ")";
+        if (InDungeonBounds(cursPosition)) {
+            const uint16_t hitPiece = dPiece[cursPosition.x][cursPosition.y];
+            geoInfo += "p" + std::to_string(hitPiece);
+        }
+        DrawString(out, geoInfo,
+            Rectangle { Point { 10, 82 }, Size { 500, 16 } },
+            TextRenderOptions { .flags = UiFlags::ColorBlue });
+    }
 }
 
 /**
@@ -1115,6 +1410,29 @@ void HandleFirstPersonInput(const SDL_Event &event) {
             }
         }
     }
+}
+
+void ClearFirstPersonMouseDeltas()
+{
+    g_input.mouseDeltaX = 0.0f;
+    g_input.mouseDeltaY = 0.0f;
+}
+
+void ToggleFirstPersonGeometryDebug()
+{
+    g_geoDebug = !g_geoDebug;
+    // Discard stale look deltas so toggling never jerks the camera.
+    ClearFirstPersonMouseDeltas();
+}
+
+void OnEnterFirstPersonMode()
+{
+    // Reconcile the camera with the authoritative player position so FPS
+    // mode never begins with the camera embedded in solid geometry
+    // (e.g. stale coordinates from another level).
+    // Orientation is intentionally preserved across toggles.
+    if (MyPlayer != nullptr)
+        SnapCameraToTile(MyPlayer->position.tile);
 }
 
 } // namespace devilution

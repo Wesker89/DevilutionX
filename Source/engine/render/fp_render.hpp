@@ -29,4 +29,28 @@ void DrawFirstPersonView(const Surface &out, Point startPosition);
  */
 void HandleFirstPersonInput(const SDL_Event &event);
 
+/**
+ * @brief Discard accumulated mouse-look deltas.
+ *
+ * Called when leaving FPS mode so stale motion does not rotate
+ * the camera on re-entry.
+ */
+void ClearFirstPersonMouseDeltas();
+
+/**
+ * @brief Toggle the geometry-only diagnostic view (flat untextured materials).
+ *
+ * Developer-only, off by default. Bound to F4.
+ */
+void ToggleFirstPersonGeometryDebug();
+
+/**
+ * @brief Reconcile the FPS camera with the authoritative player position.
+ *
+ * Called when entering FPS mode (and when the level changes underneath
+ * it) so the camera never starts embedded in solid geometry.
+ * Orientation is preserved; only the position is corrected.
+ */
+void OnEnterFirstPersonMode();
+
 } // namespace devilution

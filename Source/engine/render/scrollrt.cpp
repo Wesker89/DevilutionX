@@ -1311,18 +1311,26 @@ void DrawGame(const Surface &fullOut, Point position, Displacement offset)
  * @param out Buffer to render to
  * @param startPosition Center of view in dPiece coordinates
  */
+// Track FPS/classic mode transitions for cleanup
+static bool wasInFPMode = false;
+
 void DrawView(const Surface &out, Point startPosition)
 {
 	if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson) {
+		if (!wasInFPMode)
+			OnEnterFirstPersonMode();
+		wasInFPMode = true;
 		DrawFirstPersonView(out, startPosition);
 		return;
 	}
 
-	// Disable relative mouse mode when switching back to isometric
-	static bool wasInFPMode = false;
+	// Leaving FPS mode: disable relative mouse mode and restore cursor
 	if (wasInFPMode) {
-		SDL_SetRelativeMouseMode(SDL_FALSE);
 		wasInFPMode = false;
+		SDL_SetRelativeMouseMode(SDL_FALSE);
+		SDL_ShowCursor(SDL_ENABLE);
+		// Clear stale accumulated deltas so camera doesn't jump on re-entry
+		ClearFirstPersonMouseDeltas();
 	}
 
 #ifdef _DEBUG

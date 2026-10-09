@@ -2160,6 +2160,17 @@ void InitKeymapActions()
 	    nullptr,
 	    CanPlayerTakeAction);
 	options.Keymapper.AddAction(
+	    "ToggleFPGeometryDebug",
+	    N_("Toggle FPS Geometry Debug"),
+	    N_("Show flat untextured materials in first-person view (developer diagnostic)."),
+	    SDLK_F4,
+	    [] {
+		    if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson)
+			    ToggleFirstPersonGeometryDebug();
+	    },
+	    nullptr,
+	    CanPlayerTakeAction);
+	options.Keymapper.AddAction(
 	    "GameInfo",
 	    N_("Game info"),
 	    N_("Displays game infos."),

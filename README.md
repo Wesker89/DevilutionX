@@ -86,6 +86,7 @@ This fork adds a first-person perspective rendering mode to DevilutionX while pr
 | **A** | Strafe left |
 | **D** | Strafe right |
 | **Mouse** | **Always-on mouselook** (FPS-style camera rotation) |
+| **F4** | Toggle geometry-only diagnostic view (flat colors, dev-only) |
 | **TAB** | Toggle automap |
 | **SPACE / LCTRL** | Up / Down |
 | **LMB** | Attack / Interact (uses Diablo's combat system) |
@@ -98,21 +99,29 @@ This fork adds a first-person perspective rendering mode to DevilutionX while pr
   - ✅ Camera system (position, yaw/pitch, WASD movement, mouse look)
   - ✅ Raycasting-based dungeon renderer (floor/ceiling/walls from tile data)
   - ✅ Collision detection with dungeon walls
-  - ✅ **Textured walls** (extracts vertical wall strips from dungeon CEL trapezoid tiles via `SampleDungeonTexture(isWall=true)`)
-  - ✅ **Textured floors** (perspective-correct floor texture mapping with tiling from CEL rectangle parts)
-  - ✅ **Ceiling rendering** (distance-faded with subtle pattern)
+  - ✅ **Textured walls** (real wall-stack art: `mt[2..MicroTileLen)` layers, u mapped across the left/right pair like `DrawCell`; single-frame layers mirrored across the face instead of flat fallback — verified against real L1 MIN data)
+  - ✅ **Textured floors** (real floor art: per-pixel tile lookup of `mt[0]`/`mt[1]` triangle frames via `SampleFloorAt`, per-pixel `dLight` lighting; forced-triangle sampling like `DrawFloorTile` so Square-typed floor blocks can't cause OOB garbage)
+  - ✅ **Texture diagnostics** (art-vs-fallback counters on-screen + `LogFpTextureStats`: level, MicroTileLen, player piece frames/types, last wall/floor tile+frame)
+  - ✅ **Correct CEL frame geometry** (32px frames, both triangle halves, trapezoid tri+rect layout; fixed OOB reads and broken offsets in `SampleDungeonTexture`/`TriangleRowWidth`/`TriangleRowOffset`)
+  - ✅ **Open doors pass through** (rays read live `dPiece`, which `ObjSetMicro` rewrites on open/close — no separate tracking)
+  - ✅ **Ceiling rendering** (dark procedural placeholder — the original game has no ceiling art)
   - ✅ **Proper CLX sprite rendering** (on-the-fly RLE decode → scale blit via `DrawScaledSprite()`)
-  - ✅ **Wall/floor texture separation** (uses `isWall` parameter to extract vertical wall strips vs. floor tiles from trapezoid CEL frames)
-  - ✅ Lighting adaptation (using existing light tables on walls/floor/sprites)
+  - ✅ Lighting adaptation (using existing light tables on walls/floor/sprites, per-pixel for floors)
   - ✅ Sprite billboarding (monsters, players, items via `RenderSprites()`)
-  - ✅ **FPS-style mouselook** (always-on via relative mouse mode, **inverted pitch**)
+  - ✅ **FPS-style mouselook** (always-on via relative mouse mode, **normal pitch: up=look up**)
+  - ✅ **Cursor restoration on mode switch** (fixes dual-static-variable bug in `wasInFPMode`)
 - 🔄 **Milestone 4**: Gameplay integration (in progress)
   - ✅ **Crosshair targeting** (`UpdateCrosshairTarget()` - sets `cursPosition`, `pcursmonst`, `pcursitem`, `ObjectUnderCursor`)
   - ✅ **Crosshair display** (`DrawCrosshair()` - centered reticle, color-coded by target type)
   - ✅ **LMB interaction** (`HandleFirstPersonInput()` → `PerformPrimaryAction()`)
   - ✅ **Door interaction** (distance-checked, opens/closes via `PerformPrimaryAction()`)
   - ✅ **Targeting feedback** (crosshair color changes, debug text shows target + distance)
-  - ✅ **WASD movement** (camera-relative, sends `CMD_WALKXY` commands via `SendFPWalkCommand()`)
+  - ✅ **WASD movement** (camera-relative walk commands via `RefreshFPWalkCommand()` → `CMD_WALKXY`; camera follows the authoritative player tile — no parallel simulation, no render-thread sim writes)
+  - ✅ **Correct triangle row orientation** (left-type rows are right-aligned per `RenderTriangleLower`; `srcX=0` is the east end — verified against dun_render.cpp + foliage extractors)
+  - ✅ **Geometry diagnostic mode** (F4: flat untextured materials + tile-grid overlay + tile/piece inspector readout — gray walkable floors, dark solid, green real-door tiles, per-orientation wall colors; off by default)
+  - ✅ **FPS entry placement** (`OnEnterFirstPersonMode()` + level-change detect: camera snaps to player tile, walkable-search fallback — no more starting stuck in walls)
+  - ✅ **Geometry diagnostic mode** (F4: flat untextured materials — gray walkable floors, dark solid, green doors, per-orientation wall colors; off by default)
+  - ✅ **Texture diagnostics** (art-vs-fallback pixel counters on-screen + periodic `LogFpTextureStats` log: level, MicroTileLen, player piece frames)
   - 🔄 Melee/ranged combat integration
   - 🔄 Spell casting integration
 - ⏳ **Milestone 5**: Polish & compatibility
