@@ -1,0 +1,809 @@
+diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
+index c53db0c..a74c1ae 100644
+--- a/Source/CMakeLists.txt
++++ b/Source/CMakeLists.txt
+@@ -81,7 +81,8 @@ set(libdevilutionx_SRCS
+ 
+   engine/render/automap_render.cpp
+   engine/render/scrollrt.cpp
+-  engine/render/fp_render.cpp
++  engine/render/fp_render.cpp
++  engine/render/fp_texture.cpp
+ 
+   items/validation.cpp
+ 
+diff --git a/Source/engine/render/fp_render.cpp b/Source/engine/render/fp_render.cpp
+index d2ab38f..f75335e 100644
+--- a/Source/engine/render/fp_render.cpp
++++ b/Source/engine/render/fp_render.cpp
+@@ -17,6 +17,7 @@
+ #include "engine/point.hpp"
+ #include "engine/render/clx_render.hpp"
+ #include "engine/render/dun_render.hpp"
++#include "engine/render/fp_texture.hpp"
+ #include "engine/render/primitive_render.hpp"
+ #include "engine/render/text_render.hpp"
+ #include "levels/dun_tile.hpp"
+@@ -74,105 +75,21 @@ constexpr int MAX_RAY_DISTANCE = 50; // tiles
+ constexpr int DUNGEON_WIDTH = MAXDUNX;
+ constexpr int DUNGEON_HEIGHT = MAXDUNY;
+ 
+-// Wall height in tile units
+-constexpr float WALL_HEIGHT = 2.5f;
+-constexpr float CEILING_HEIGHT = WALL_HEIGHT;
+ 
+-// Texture mapping
+-constexpr int TEXTURE_SIZE = 64;
++// Source art pixels per world unit of height. Diablo uses a 2:1 dimetric projection,
++// so one tile of height is cos(30deg) * ~45px = ~39px of sprite.
++constexpr float PIXELS_PER_TILE_HEIGHT = 39.0f;
+ 
+-/**
+- * Sample a pixel from a dungeon CEL frame at UV coordinates.
+- * Handles different tile types (Square, TransparentSquare, Left/RightTrapezoid).
+- * @param frameData Raw frame data from GetDunFrame
+- * @param tileType Type of tile
+- * @param u Horizontal coordinate [0, 1]
+- * @param v Vertical coordinate [0, 1]
+- * @return Palette color index (0-255)
+- */
+-uint8_t SampleDungeonTexture(const uint8_t *frameData, TileType tileType, float u, float v, bool isWall = false) {
+-    if (frameData == nullptr)
+-        return 0;
+-
+-    u = std::clamp(u, 0.0f, 1.0f);
+-    v = std::clamp(v, 0.0f, 1.0f);
+-
+-    int texX = static_cast<int>(u * (TEXTURE_SIZE - 1));
+-    int texY = static_cast<int>(v * (TEXTURE_SIZE - 1));
+-
+-    switch (tileType) {
+-    case TileType::Square: {
+-        // Simple 64x32 array (but we treat as 64x64 for TEXTURE_SIZE)
+-        int srcY = std::min(texY, static_cast<int>(DunFrameHeight) - 1);
+-        return frameData[srcY * DunFrameWidth + texX];
+-    }
+-    case TileType::TransparentSquare: {
+-        // RLE encoded - decode on the fly (simplified: use fallback)
+-        // For now, return a color based on position
+-        return static_cast<uint8_t>(64 + (texX + texY) % 128);
+-    }
+-    case TileType::LeftTrapezoid: {
+-        // Bottom 16 rows: triangle (LeftTriangle encoding)
+-        // Top 16 rows: rectangle (64x16)
+-        if (texY < 16) {
+-            // Triangle part - similar to LeftTriangle
+-            int row = 15 - texY; // Bottom-up
+-            int width = (row + 1) * 2; // 2, 4, 6, ..., 32
+-            int startX = (TEXTURE_SIZE - width) / 2;
+-            if (texX < startX || texX >= startX + width)
+-                return 0; // Transparent
+-            int srcX = texX - startX;
+-            int srcOffset = (row * (row + 1)) + srcX; // Simplified triangle indexing
+-            return frameData[srcOffset % (ReencodedTrapezoidFrameSize)];
+-        } else {
+-            // Rectangle part (top 16 rows)
+-            int rectY = texY - 16;
+-            int srcOffset = ReencodedTrapezoidFrameSize - (16 * TEXTURE_SIZE) + rectY * TEXTURE_SIZE + texX;
+-            return frameData[srcOffset];
+-        }
+-    }
+-    case TileType::RightTrapezoid: {
+-        // Mirror of LeftTrapezoid
+-        if (texY < 16) {
+-            int row = 15 - texY;
+-            int width = (row + 1) * 2;
+-            int startX = (TEXTURE_SIZE - width) / 2;
+-            if (texX < startX || texX >= startX + width)
+-                return 0;
+-            int srcX = texX - startX;
+-            int srcOffset = (row * (row + 1)) + srcX;
+-            return frameData[srcOffset % (ReencodedTrapezoidFrameSize)];
+-        } else {
+-            int rectY = texY - 16;
+-            int srcOffset = ReencodedTrapezoidFrameSize - (16 * TEXTURE_SIZE) + rectY * TEXTURE_SIZE + texX;
+-            return frameData[srcOffset];
+-        }
+-    }
+-    case TileType::LeftTriangle:
+-    case TileType::RightTriangle: {
+-        // Triangle encoding - 31 rows of varying width
+-        int row = std::min(texY, static_cast<int>(DunFrameTriangleHeight) - 1);
+-        int width = (row < 16) ? (row + 1) * 2 : (31 - row) * 2;
+-        int startX = (TEXTURE_SIZE - width) / 2;
+-        if (texX < startX || texX >= startX + width)
+-            return 0;
+-        int srcX = texX - startX;
+-        // Simplified triangle indexing
+-        int srcOffset = (row * (row + 1) / 2) * 2 + srcX;
+-        return frameData[srcOffset % ReencodedTriangleFrameSize];
+-    }
+-    default:
+-        return 0;
+-    }
++/** Wall height in tile units, derived from how tall the current level's wall art actually is. */
++float WallHeight()
++{
++    return static_cast<float>(FpWallPixelHeight()) / PIXELS_PER_TILE_HEIGHT;
+ }
+ 
+-/**
+- * Get the base color for a dungeon wall tile (used when texturing fails)
+- */
+-uint8_t GetWallBaseColor(int textureId, bool isDoor) {
+-    if (isDoor)
+-        return 80;
+-    return static_cast<uint8_t>(64 + (textureId % 128));
++const uint8_t *GetLightTable(int index)
++{
++    const int maxIndex = static_cast<int>(std::size(LightTables)) - 1;
++    return LightTables[std::clamp(index, 0, maxIndex)].data();
+ }
+ 
+ // Input state
+@@ -199,10 +116,10 @@ struct RayHit {
+     int side = 0; // 0 = X side, 1 = Y side
+     bool hitWall = false;
+     bool hitDoor = false;
+-    int textureId = 0;
+-    float textureX = 0.0f;
+-    int lightTableIndex = 0;
+-    TileType tileType = TileType::Square;
++    uint16_t pieceId = 0;   // dPiece of the tile that was hit
++    float textureX = 0.0f;  // fractional position along the hit face (other axis)
++    int lightTileX = 0;     // open tile in front of the face; its light is used for shading
++    int lightTileY = 0;
+ };
+ 
+ /**
+@@ -453,7 +370,11 @@ RayHit CastRay(float rayAngle) {
+ 
+     // DDA loop
+     int side = 0;
++    int prevX = mapX;
++    int prevY = mapY;
+     for (int i = 0; i < MAX_RAY_DISTANCE; ++i) {
++        prevX = mapX;
++        prevY = mapY;
+         if (sideDistX < sideDistY) {
+             sideDistX += deltaDistX;
+             mapX += stepX;
+@@ -471,29 +392,17 @@ RayHit CastRay(float rayAngle) {
+             hit.tileY = mapY;
+             hit.side = side;
+             hit.distance = (side == 0) ? sideDistX - deltaDistX : sideDistY - deltaDistY;
+-            hit.lightTableIndex = GetTileLight(mapX, mapY);
+-
+-            // Calculate texture coordinate
+-            float wallX;
+-            if (side == 0)
+-                wallX = g_camera.y + hit.distance * rayDirY;
+-            else
+-                wallX = g_camera.x + hit.distance * rayDirX;
++            hit.lightTileX = prevX;
++            hit.lightTileY = prevY;
++
++            // Position along the face, [0,1)
++            float wallX = (side == 0) ? g_camera.y + hit.distance * rayDirY
++                                      : g_camera.x + hit.distance * rayDirX;
+             wallX -= std::floor(wallX);
+             hit.textureX = wallX;
+ 
+-            // Get texture from dungeon data
+-            if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT) {
+-                uint16_t pieceId = dPiece[mapX][mapY];
+-                if (pieceId > 0 && pieceId < sizeof(DPieceMicros) / sizeof(DPieceMicros[0])) {
+-                    // Use first micro tile for texture
+-                    LevelCelBlock block = { DPieceMicros[pieceId].mt[0] };
+-                    if (block.hasValue()) {
+-                        hit.textureId = block.frame();
+-                        hit.tileType = block.type();
+-                    }
+-                }
+-            }
++            if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT)
++                hit.pieceId = dPiece[mapX][mapY];
+             break;
+         }
+     }
+@@ -502,199 +411,91 @@ RayHit CastRay(float rayAngle) {
+ }
+ 
+ /**
+- * Draw a vertical slice (column) of the wall
++ * Wolfenstein-style renderer.
++ *
++ * Per screen column: cast one ray (DDA) to find the wall, then for every pixel of that column either
++ *  - sample the wall texture (u from where the ray hit the face, v from the pixel's height in the world), or
++ *  - floor/ceiling-cast: turn the pixel row into a perpendicular depth, walk that far along the ray and
++ *    sample the floor texture at the world position we land on.
++ *
++ * All depths are perpendicular (fisheye-corrected) and the view uses a flat projection plane
++ * (ray angle = atan(cameraX * tan(FOV/2))), so walls and floors line up and straight edges stay straight.
+  */
+-void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int screenWidth, int screenHeight) {
+-    if (!hit.hitWall || hit.distance <= 0)
+-        return;
+-
+-    // Correct for fisheye effect
+-    float correctedDist = hit.distance * std::cos(g_camera.yaw - (g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV));
+-
+-    // Calculate wall height on screen
+-    float wallHeightOnScreen = (screenHeight / correctedDist) * (WALL_HEIGHT / 2.0f);
+-
+-    int drawStart = static_cast<int>(screenHeight / 2 - wallHeightOnScreen / 2 + g_camera.pitch * screenHeight);
+-    int drawEnd = static_cast<int>(screenHeight / 2 + wallHeightOnScreen / 2 + g_camera.pitch * screenHeight);
+-
+-    drawStart = std::max(0, drawStart);
+-    drawEnd = std::min(screenHeight - 1, drawEnd);
+-
+-    if (drawStart >= drawEnd)
+-        return;
+-
+-    // Get light table
+-    const uint8_t *lightTable = (hit.lightTableIndex > 0 && hit.lightTableIndex < static_cast<int>(std::size(LightTables)))
+-        ? LightTables[hit.lightTableIndex].data()
+-        : LightTables[0].data();
+-
+-    // Get frame data for this tile
+-    const uint8_t *frameData = nullptr;
+-    if (hit.textureId > 0) {
+-        frameData = GetDunFrame(pDungeonCels.get(), hit.textureId);
+-    }
+-
+-    // Draw vertical line with texture sampling
+-    for (int y = drawStart; y <= drawEnd; ++y) {
+-        float v = (y - drawStart) / static_cast<float>(drawEnd - drawStart);
+-        float u = hit.textureX;
+-
+-        // Sample texture from dungeon CEL data
+-        uint8_t color;
+-        if (frameData != nullptr) {
+-            color = SampleDungeonTexture(frameData, hit.tileType, u, v, true);
+-        } else {
+-            // Fallback color
+-            color = GetWallBaseColor(hit.textureId, hit.hitDoor);
+-        }
+-
+-        // Vertical gradient (darker at top/bottom)
+-        color = static_cast<uint8_t>(color * (0.5f + 0.5f * std::sin(v * M_PI)));
++void RenderDungeonRaycast(const Surface &out)
++{
++    const int screenWidth = out.w();
++    const int screenHeight = out.h();
++
++    const float tanHalfFov = std::tan(FOV * 0.5f);
++    const float focal = (screenWidth * 0.5f) / tanHalfFov; // pixels; same for x and y (square pixels)
++    const float horizon = screenHeight * 0.5f + std::tan(g_camera.pitch) * focal;
++    const float eye = g_camera.height;
++    const float wallHeight = WallHeight();
++    const float ceilingGap = std::max(wallHeight - eye, 0.01f);
++    const int maxLight = static_cast<int>(std::size(LightTables)) - 1;
+ 
+-        // Apply lighting
+-        if (lightTable != nullptr) {
+-            color = lightTable[color];
++    for (int x = 0; x < screenWidth; ++x) {
++        const float cameraX = 2.0f * (x + 0.5f) / screenWidth - 1.0f;
++        const float offset = std::atan(cameraX * tanHalfFov);
++        const float cosOffset = std::cos(offset);
++        const float rayAngle = g_camera.yaw + offset;
++        const float rayDirX = std::sin(rayAngle);
++        const float rayDirY = -std::cos(rayAngle);
++
++        const RayHit hit = CastRay(rayAngle);
++        const float perp = hit.distance * cosOffset; // perpendicular distance
++
++        int wallTop = 1;
++        int wallBottom = 0; // empty span when there's no wall
++        if (hit.hitWall && perp > NEAR_PLANE) {
++            wallBottom = static_cast<int>(horizon + eye * focal / perp);
++            wallTop = static_cast<int>(horizon - ceilingGap * focal / perp);
+         }
+ 
+-        // Darken based on distance
+-        float fade = 1.0f - std::min(hit.distance / FAR_PLANE, 1.0f);
+-        color = static_cast<uint8_t>(color * fade);
+-
+-        // Darken Y-side walls for depth perception
+-        if (hit.side == 1)
+-            color = static_cast<uint8_t>(color * 0.7f);
+-
+-        *out.at(screenX, y) = color;
+-    }
+-}
+-
+-/**
+- * Draw floor and ceiling with textured rendering
+- */
+-void DrawFloorCeiling(const Surface &out, int screenX, const RayHit &hit, int screenWidth, int screenHeight) {
+-    int horizon = screenHeight / 2 + static_cast<int>(g_camera.pitch * screenHeight);
+-
+-    // Get the tile we're standing on for floor texture
+-    int mapX = static_cast<int>(g_camera.x);
+-    int mapY = static_cast<int>(g_camera.y);
+-
+-    // Pre-fetch floor and ceiling textures for the current tile
+-    const uint8_t *floorFrameData = nullptr;
+-    TileType floorTileType = TileType::Square;
+-    const uint8_t *ceilFrameData = nullptr;
+-    TileType ceilTileType = TileType::Square;
+-
+-    if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT) {
+-        uint16_t pieceId = dPiece[mapX][mapY];
+-        if (pieceId > 0 && pieceId < sizeof(DPieceMicros) / sizeof(DPieceMicros[0])) {
+-            // Get floor texture (first micro tile is typically the floor)
+-            LevelCelBlock floorBlock = { DPieceMicros[pieceId].mt[0] };
+-            if (floorBlock.hasValue()) {
+-                floorFrameData = GetDunFrame(pDungeonCels.get(), floorBlock.frame());
+-                floorTileType = floorBlock.type();
+-            }
+-
+-            // For ceiling, use a generic ceiling texture or derive from wall
+-            // For now, use a simple ceiling texture
+-            ceilFrameData = nullptr; // Will use fallback
++        const uint8_t *wallLight = nullptr;
++        if (wallBottom >= wallTop) {
++            // One light table per column, the neighbouring face is a touch darker for depth.
++            int light = GetTileLight(hit.lightTileX, hit.lightTileY) + (hit.side == 1 ? 1 : 0);
++            wallLight = GetLightTable(std::min(light, maxLight));
+         }
+-    }
+-
+-    // Light table for current position
+-    int lightIdx = GetTileLight(mapX, mapY);
+-    const uint8_t *lightTable = (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
+-        ? LightTables[lightIdx].data()
+-        : LightTables[0].data();
+-
+-    for (int y = 0; y < screenHeight; ++y) {
+-        uint8_t color = 0;
+-
+-        if (y < horizon) {
+-            // Ceiling rendering
+-            float p = horizon - y;
+-            if (p == 0) p = 1;
+-            float posZ = 0.5f * screenHeight;
+-            float rowDistance = posZ / p;
+-
+-            // Calculate world position for this ceiling pixel
+-            float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
+-            float rayDirX = std::sin(rayAngle);
+-            float rayDirY = -std::cos(rayAngle);
+-
+-            float floorX = g_camera.x + rayDirX * rowDistance;
+-            float floorY = g_camera.y + rayDirY * rowDistance;
+ 
+-            // Simple ceiling texture - dark with subtle pattern
+-            int texX = static_cast<int>(floorX * 16) & 63;
+-            int texY = static_cast<int>(floorY * 16) & 63;
+-            color = static_cast<uint8_t>(16 + ((texX + texY) & 15));
+-
+-            // Distance fade
+-            float fade = 1.0f - std::min(rowDistance / FAR_PLANE, 1.0f);
+-            color = static_cast<uint8_t>(color * fade * 0.5f); // Ceiling darker
+-
+-        } else {
+-            // Floor rendering
+-            float p = y - screenHeight / 2 - g_camera.pitch * screenHeight;
+-            if (p == 0) continue;
+-            float posZ = 0.5f * screenHeight;
+-            float rowDistance = posZ / p;
+-
+-            // Calculate world position for this floor pixel
+-            float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
+-            float rayDirX = std::sin(rayAngle);
+-            float rayDirY = -std::cos(rayAngle);
+-
+-            float floorX = g_camera.x + rayDirX * rowDistance;
+-            float floorY = g_camera.y + rayDirY * rowDistance;
+-
+-            // Sample floor texture if available
+-            if (floorFrameData != nullptr) {
+-                // Convert world coordinates to texture coordinates
+-                float texU = (floorX - std::floor(floorX)) * 1.0f;
+-                float texV = (floorY - std::floor(floorY)) * 1.0f;
+-
+-                // Clamp to [0, 1]
+-                texU = texU - std::floor(texU);
+-                texV = texV - std::floor(texV);
+-
+-                color = SampleDungeonTexture(floorFrameData, floorTileType, texU, texV, false);
++        for (int y = 0; y < screenHeight; ++y) {
++            uint8_t color = 0;
++
++            if (y >= wallTop && y <= wallBottom) {
++                // ---- wall ----
++                const float z = eye - (y + 0.5f - horizon) * perp / focal; // world height of this pixel
++                const float v = z / wallHeight;                           // 0 = floor, 1 = top
++                const float u = (hit.side == 0) ? hit.textureX : 1.0f - hit.textureX;
++                if (!FpSampleWall(hit.pieceId, hit.side == 1, u, v, color))
++                    color = 0;
++                color = wallLight[color];
+             } else {
+-                // Fallback floor color based on tile
+-                color = 32;
++                // ---- floor / ceiling ----
++                const float dy = (y + 0.5f) - horizon;
++                if (std::abs(dy) < 0.5f) {
++                    *out.at(x, y) = 0;
++                    continue;
++                }
++                const bool isCeiling = dy < 0;
++                const float rowDepth = isCeiling ? ceilingGap * focal / -dy : eye * focal / dy; // perpendicular
++                const float dist = rowDepth / cosOffset;                                       // along the ray
++
++                const float wx = g_camera.x + rayDirX * dist;
++                const float wy = g_camera.y + rayDirY * dist;
++                const int tx = static_cast<int>(std::floor(wx));
++                const int ty = static_cast<int>(std::floor(wy));
++
++                if (tx >= 0 && tx < DUNGEON_WIDTH && ty >= 0 && ty < DUNGEON_HEIGHT && rowDepth < FAR_PLANE) {
++                    // The original has no ceiling art: reuse the floor stone, just darker.
++                    if (!FpSampleFloor(dPiece[tx][ty], wx - tx, wy - ty, color))
++                        color = 0;
++                    const int light = GetTileLight(tx, ty) + (isCeiling ? 4 : 0);
++                    color = GetLightTable(std::min(light, maxLight))[color];
++                }
+             }
+ 
+-            // Distance fade
+-            float fade = 1.0f - std::min(rowDistance / FAR_PLANE, 1.0f);
+-            color = static_cast<uint8_t>(color * fade);
+-        }
+-
+-        // Apply lighting
+-        if (lightTable != nullptr) {
+-            color = lightTable[color];
+-        }
+-
+-        *out.at(screenX, y) = color;
+-    }
+-}
+-
+-/**
+- * Render the dungeon using raycasting
+- */
+-void RenderDungeonRaycast(const Surface &out) {
+-    int screenWidth = out.w();
+-    int screenHeight = out.h();
+-
+-    for (int x = 0; x < screenWidth; ++x) {
+-        float rayAngle = g_camera.yaw - FOV / 2 + (x / static_cast<float>(screenWidth)) * FOV;
+-        RayHit hit = CastRay(rayAngle);
+-
+-        // Draw floor and ceiling first
+-        DrawFloorCeiling(out, x, hit, screenWidth, screenHeight);
+-
+-        // Draw wall if hit
+-        if (hit.hitWall) {
+-            DrawWallColumn(out, x, hit, screenWidth, screenHeight);
++            *out.at(x, y) = color;
+         }
+     }
+ }
+diff --git a/Source/engine/render/fp_texture.cpp b/Source/engine/render/fp_texture.cpp
+new file mode 100644
+index 0000000..83f1a5a
+--- /dev/null
++++ b/Source/engine/render/fp_texture.cpp
+@@ -0,0 +1,253 @@
++/**
++ * @file fp_texture.cpp
++ *
++ * See fp_texture.hpp.
++ *
++ * Frame layouts (all stored bottom row first, see levels/dun_tile.hpp):
++ *   Square             1024 bytes, 32 rows x 32
++ *   TransparentSquare  RLE, runs never cross rows
++ *   LeftTriangle       512 bytes, 31 rows, widths 2,4..30,32,30..4,2, right-aligned
++ *   RightTriangle      512 bytes, same widths, left-aligned
++ *   Left/RightTrapezoid 784 bytes: lower 16 triangle rows (272 bytes) + 32x16 rectangle (512 bytes)
++ */
++#include "engine/render/fp_texture.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <memory>
++
++#ifndef FP_TEXTURE_TEST
++#include "engine/render/dun_render.hpp"
++#include "levels/dun_tile_data.hpp"
++#include "levels/gendung.h"
++#endif
++
++namespace devilution {
++
++namespace {
++
++constexpr int FrameSize = 32;
++
++void ClearTile(FpDecodedTile &out)
++{
++	std::memset(out.pix, 0, sizeof(out.pix));
++	std::memset(out.mask, 0, sizeof(out.mask));
++}
++
++/** Row `i` counted from the bottom lives at y = 31 - i (top-down buffer). */
++void PutRow(FpDecodedTile &out, int i, int x, const uint8_t *src, int width)
++{
++	const int y = FrameSize - 1 - i;
++	if (y < 0 || y >= FrameSize)
++		return;
++	for (int k = 0; k < width; ++k) {
++		const int xx = x + k;
++		if (xx < 0 || xx >= FrameSize)
++			continue;
++		out.pix[y * FrameSize + xx] = src[k];
++		out.mask[y * FrameSize + xx] = 1;
++	}
++}
++
++/**
++ * Decode the triangle rows [0, rows) starting at bottom row 0 and return the number of source bytes consumed.
++ * Widths: i < 16 -> 2*(i+1); i >= 16 -> 2*(31-i).
++ */
++int DecodeTriangleRows(FpDecodedTile &out, const uint8_t *src, int rows, bool rightAligned)
++{
++	int consumed = 0;
++	for (int i = 0; i < rows; ++i) {
++		const int width = i < 16 ? 2 * (i + 1) : 2 * (31 - i);
++		const int x = rightAligned ? FrameSize - width : 0;
++		PutRow(out, i, x, src + consumed, width);
++		consumed += width;
++	}
++	return consumed;
++}
++
++} // namespace
++
++void FpDecodeDunFrame(const uint8_t *src, TileType type, FpDecodedTile &out)
++{
++	ClearTile(out);
++	if (src == nullptr)
++		return;
++
++	switch (type) {
++	case TileType::Square:
++		for (int i = 0; i < FrameSize; ++i)
++			PutRow(out, i, 0, src + i * FrameSize, FrameSize);
++		break;
++
++	case TileType::TransparentSquare:
++		for (int i = 0; i < FrameSize; ++i) {
++			int x = 0;
++			while (x < FrameSize) {
++				const int8_t run = static_cast<int8_t>(*src++);
++				if (run > 0) {
++					const int n = std::min<int>(run, FrameSize - x);
++					PutRow(out, i, x, src, n);
++					src += run; // always consume the full run from the stream
++					x += run;
++				} else if (run < 0) {
++					x -= run;
++				} else {
++					// A zero-length run would never advance; treat it as end of row.
++					break;
++				}
++			}
++		}
++		break;
++
++	case TileType::LeftTriangle:
++		DecodeTriangleRows(out, src, 31, /*rightAligned=*/true);
++		break;
++
++	case TileType::RightTriangle:
++		DecodeTriangleRows(out, src, 31, /*rightAligned=*/false);
++		break;
++
++	case TileType::LeftTrapezoid:
++	case TileType::RightTrapezoid: {
++		const bool right = type == TileType::LeftTrapezoid; // "Left" art is right-aligned
++		const int used = DecodeTriangleRows(out, src, 16, right);
++		const uint8_t *rect = src + used; // 272 bytes in
++		for (int k = 0; k < 16; ++k)
++			PutRow(out, 16 + k, 0, rect + k * FrameSize, FrameSize);
++		break;
++	}
++	}
++}
++
++#ifndef FP_TEXTURE_TEST
++
++namespace {
++
++// Cache key: 15 bits of LevelCelBlock::data (type + frame), plus bit 15 for "forced triangle" floors.
++constexpr size_t CacheSize = 1 << 16;
++std::unique_ptr<FpDecodedTile> g_cache[CacheSize];
++const std::byte *g_cacheCels = nullptr;
++
++void SyncCache()
++{
++	// Dungeon art is reloaded on every level change; stale pointers must never be used.
++	if (g_cacheCels != pDungeonCels.get()) {
++		FpTextureReset();
++		g_cacheCels = pDungeonCels.get();
++	}
++}
++
++const FpDecodedTile *GetTile(LevelCelBlock block, bool forceTriangle, TileType forcedType)
++{
++	if (!block.hasValue() || pDungeonCels == nullptr)
++		return nullptr;
++	SyncCache();
++
++	const TileType type = forceTriangle ? forcedType : block.type();
++	const size_t key = (static_cast<size_t>(block.data) & 0x7FFF) | (forceTriangle ? 0x8000u : 0u);
++	auto &slot = g_cache[key];
++	if (slot == nullptr) {
++		slot = std::make_unique<FpDecodedTile>();
++		FpDecodeDunFrame(GetDunFrame(pDungeonCels.get(), block.frame()), type, *slot);
++	}
++	return slot.get();
++}
++
++inline bool Texel(const FpDecodedTile *tile, int x, int y, uint8_t &color)
++{
++	if (tile == nullptr || x < 0 || x >= FrameSize || y < 0 || y >= FrameSize)
++		return false;
++	if (tile->mask[y * FrameSize + x] == 0)
++		return false;
++	color = tile->pix[y * FrameSize + x];
++	return true;
++}
++
++inline int PieceRows()
++{
++	return std::max<int>(1, static_cast<int>(MicroTileLen) / 2);
++}
++
++} // namespace
++
++void FpTextureReset()
++{
++	for (auto &slot : g_cache)
++		slot.reset();
++	g_cacheCels = pDungeonCels.get();
++}
++
++int FpWallPixelHeight()
++{
++	// The sloped floor edge eats up to 16px at the top of the sprite.
++	return PieceRows() * FrameSize - 16;
++}
++
++bool FpSampleFloor(uint16_t pieceId, float a, float b, uint8_t &color)
++{
++	if (pieceId == 0 || pieceId >= MAXTILES)
++		return false;
++
++	a = std::clamp(a, 0.0f, 0.9999f);
++	b = std::clamp(b, 0.0f, 0.9999f);
++
++	// Iso projection of the tile footprint onto the 64x32 diamond:
++	//   x grows toward screen bottom-left, y toward bottom-right.
++	const float px = 32.0f + (b - a) * 32.0f; // 0..64
++	const float py = (a + b) * 16.0f;         // 0..32 inside the bottom 32px row
++
++	const int column = px < 32.0f ? 0 : 1;
++	const int x = std::clamp(static_cast<int>(px) - column * 32, 0, FrameSize - 1);
++	const int y = std::clamp(static_cast<int>(py), 1, FrameSize - 1); // triangles have no row 0
++
++	// The original floor pass (DrawFloorTile) always draws mt[0]/mt[1] as left/right triangles.
++	const FpDecodedTile *tile = GetTile(LevelCelBlock { DPieceMicros[pieceId].mt[column] }, true,
++	    column == 0 ? TileType::LeftTriangle : TileType::RightTriangle);
++
++	// Triangle edges are jagged; probe a couple of neighbours so we never punch holes.
++	static constexpr int Dx[] = { 0, -1, 1, 0, 0, -2, 2 };
++	static constexpr int Dy[] = { 0, 0, 0, -1, 1, 0, 0 };
++	for (int k = 0; k < 7; ++k) {
++		if (Texel(tile, x + Dx[k], y + Dy[k], color))
++			return true;
++	}
++	return false;
++}
++
++bool FpSampleWall(uint16_t pieceId, bool yFace, float u, float t, uint8_t &color)
++{
++	if (pieceId == 0 || pieceId >= MAXTILES)
++		return false;
++
++	const int rows = PieceRows();
++	const int height = rows * FrameSize; // sprite height H
++	const int wallPx = FpWallPixelHeight();
++
++	u = std::clamp(u, 0.0f, 0.9999f);
++	t = std::clamp(t, 0.0f, 1.0f);
++	const int xc = static_cast<int>(u * FrameSize); // 0..31 inside the micro column
++
++	// A face is one 32px micro column. Its base line is the diamond edge, which slopes 1:2 in the sprite:
++	//   left column  (x-face): edge runs from (0, H-16) down to (32, H)
++	//   right column (y-face): edge runs from (32, H) up to (64, H-16)
++	// "Unshearing" = moving up the wall by t pixels from that sloped base.
++	const float yBase = yFace ? height - 0.5f * xc : height - 16.0f + 0.5f * xc;
++	const int column = yFace ? 1 : 0;
++
++	for (int attempt = 0; attempt < 2; ++attempt) {
++		const int col = attempt == 0 ? column : 1 - column;
++		for (int dy = 0; dy < 4; ++dy) { // nudge down a few px if we land on a transparent pixel
++			const int yTop = std::clamp(static_cast<int>(yBase - t * wallPx) + dy, 0, height - 1);
++			const int row = (height - 1 - yTop) / FrameSize; // 0 = bottom micro row
++			const int yIn = yTop - (height - FrameSize * (row + 1));
++			const FpDecodedTile *tile = GetTile(LevelCelBlock { DPieceMicros[pieceId].mt[row * 2 + col] }, false, TileType::Square);
++			if (Texel(tile, xc, yIn, color))
++				return true;
++		}
++	}
++	return false;
++}
++
++#endif // FP_TEXTURE_TEST
++
++} // namespace devilution
+diff --git a/Source/engine/render/fp_texture.hpp b/Source/engine/render/fp_texture.hpp
+new file mode 100644
+index 0000000..96b435e
+--- /dev/null
++++ b/Source/engine/render/fp_texture.hpp
+@@ -0,0 +1,60 @@
++/**
++ * @file fp_texture.hpp
++ *
++ * Texture access for the first-person raycaster.
++ *
++ * Diablo's dungeon art is not stored as plain bitmaps. Every "frame" is a 32px wide
++ * piece of an isometric tile (square, RLE square, triangle or trapezoid, see TileType).
++ * The raycaster needs ordinary linear bitmaps it can index with (x, y), so this module:
++ *
++ *   1. Decodes each frame ONCE into a flat 32x32 bitmap (+ transparency mask), cached.
++ *   2. Maps wall hits / floor points onto the original isometric sprite layout
++ *      (undoing the 2:1 iso shear) and reads texels from those bitmaps.
++ */
++#pragma once
++
++#include <cstdint>
++
++#include "levels/dun_tile.hpp"
++
++namespace devilution {
++
++/** A decoded 32x32 dungeon frame, stored top-down (row 0 = top). */
++struct FpDecodedTile {
++	uint8_t pix[32 * 32];
++	uint8_t mask[32 * 32]; // 1 = opaque, 0 = transparent / outside the shape
++};
++
++/**
++ * @brief Decodes a raw (already "reencoded") dungeon frame into a linear bitmap.
++ *
++ * Pure function: only touches `src` (at most 1024 bytes) and `out`.
++ */
++void FpDecodeDunFrame(const uint8_t *src, TileType type, FpDecodedTile &out);
++
++/** Drop all cached decoded frames. Call on level change / when pDungeonCels is reloaded. */
++void FpTextureReset();
++
++/** Height in source pixels of the wall art available above the floor line. */
++int FpWallPixelHeight();
++
++/**
++ * @brief Sample the floor at a point inside a tile.
++ * @param pieceId dPiece value of the tile
++ * @param a fractional x inside the tile, [0,1)
++ * @param b fractional y inside the tile, [0,1)
++ * @return false when the tile has no floor art
++ */
++bool FpSampleFloor(uint16_t pieceId, float a, float b, uint8_t &color);
++
++/**
++ * @brief Sample a wall face.
++ * @param pieceId dPiece value of the (solid) tile that was hit
++ * @param yFace true if the ray hit a face whose normal is the Y axis (side == 1)
++ * @param u position along the face. For x-faces: fractional y. For y-faces: 1 - fractional x.
++ * @param t height above the floor as a fraction of FpWallPixelHeight(), [0,1]
++ * @return false when no art exists at that spot
++ */
++bool FpSampleWall(uint16_t pieceId, bool yFace, float u, float t, uint8_t &color);
++
++} // namespace devilution

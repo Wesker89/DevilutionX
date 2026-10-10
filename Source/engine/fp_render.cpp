@@ -1,0 +1,921 @@
+/**
+ * @file fp_render.cpp
+ *
+ * Implementation of first-person rendering mode using raycasting.
+ * Renders the dungeon from the existing tile data using a 2.5D raycasting approach.
+ */
+#include "engine/render/fp_render.hpp"
+
+#include "utils/sdl_compat.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <array>
+#include <vector>
+
+#include "engine/point.hpp"
+#include "engine/render/clx_render.hpp"
+#include "engine/render/dun_render.hpp"
+#include "engine/render/fp_texture.hpp"
+#include "engine/render/primitive_render.hpp"
+#include "engine/render/text_render.hpp"
+#include "levels/dun_tile.hpp"
+#include "levels/dun_tile_data.hpp"
+#include "levels/gendung.h"
+#include "levels/tile_properties.hpp"
+#include "levels/trigs.h"
+#include "lighting.h"
+#include "missiles.h"
+#include "msg.h"
+#include "monster.h"
+#include "objects.h"
+#include "options.h"
+#include "player.h"
+#include "quests.h"
+#include "controls/plrctrls.h"
+
+namespace devilution {
+
+// External globals from plrctrls.cpp and other files
+extern int pcurstrig;
+extern Missile *pcursmissile;
+extern quest_id pcursquest;
+extern int8_t pcursitem;
+extern int pcursmonst;
+extern Point cursPosition;
+extern Object *ObjectUnderCursor;
+extern const Player *PlayerUnderCursor;
+
+namespace {
+
+// Camera state
+struct Camera {
+    float x = 0.0f;      // World X position (tile units)
+    float y = 0.0f;      // World Y position (tile units)
+    float yaw = 0.0f;    // Horizontal rotation (radians)
+    float pitch = 0.0f;  // Vertical rotation (radians)
+    float height = 1.6f; // Eye height above floor (in tile units)
+    bool mouseLookEnabled = true; // FPS-style always-on mouselook
+};
+
+Camera g_camera;
+bool g_cameraInitialized = false;
+
+// FPS mouse look state
+bool g_relativeMouseMode = false;
+
+// Rendering constants
+constexpr float FOV = 90.0f * M_PI / 180.0f;  // 90 degree field of view
+constexpr float NEAR_PLANE = 0.05f;
+constexpr float FAR_PLANE = 30.0f;
+constexpr int MAX_RAY_DISTANCE = 50; // tiles
+
+// Dungeon dimensions
+constexpr int DUNGEON_WIDTH = MAXDUNX;
+constexpr int DUNGEON_HEIGHT = MAXDUNY;
+
+
+// Source art pixels per world unit of height. Diablo uses a 2:1 dimetric projection,
+// so one tile of height is cos(30deg) * ~45px = ~39px of sprite.
+constexpr float PIXELS_PER_TILE_HEIGHT = 39.0f;
+
+/** Wall height in tile units, derived from how tall the current level's wall art actually is. */
+float WallHeight()
+{
+    return static_cast<float>(FpWallPixelHeight()) / PIXELS_PER_TILE_HEIGHT;
+}
+
+const uint8_t *GetLightTable(int index)
+{
+    const int maxIndex = static_cast<int>(std::size(LightTables)) - 1;
+    return LightTables[std::clamp(index, 0, maxIndex)].data();
+}
+
+// Input state
+struct InputState {
+    bool forward = false;
+    bool backward = false;
+    bool strafeLeft = false;
+    bool strafeRight = false;
+    bool up = false;
+    bool down = false;
+    float mouseDeltaX = 0.0f;
+    float mouseDeltaY = 0.0f;
+} g_input;
+
+// Movement speed (tiles per second)
+constexpr float MOVE_SPEED = 5.0f;
+constexpr float TURN_SPEED = 2.0f; // radians per second
+
+// Raycast result
+struct RayHit {
+    float distance = FAR_PLANE;
+    int tileX = -1;
+    int tileY = -1;
+    int side = 0; // 0 = X side, 1 = Y side
+    bool hitWall = false;
+    bool hitDoor = false;
+    uint16_t pieceId = 0;   // dPiece of the tile that was hit
+    float textureX = 0.0f;  // fractional position along the hit face (other axis)
+    int lightTileX = 0;     // open tile in front of the face; its light is used for shading
+    int lightTileY = 0;
+};
+
+/**
+ * Check if a tile is solid (wall)
+ */
+bool IsWallTile(int x, int y) {
+    if (x < 0 || x >= DUNGEON_WIDTH || y < 0 || y >= DUNGEON_HEIGHT)
+        return true; // Out of bounds = solid
+    return TileHasAny({ x, y }, TileProperties::Solid);
+}
+
+/**
+ * Check if a tile has a door/special
+ */
+bool IsDoorTile(int x, int y) {
+    if (x < 0 || x >= DUNGEON_WIDTH || y < 0 || y >= DUNGEON_HEIGHT)
+        return false;
+    return dSpecial[x][y] != 0;
+}
+
+/**
+ * Get light table index for a tile
+ */
+int GetTileLight(int x, int y) {
+    if (x < 0 || x >= DUNGEON_WIDTH || y < 0 || y >= DUNGEON_HEIGHT)
+        return 0;
+    return dLight[x][y];
+}
+
+/**
+ * Draw a scaled CLX sprite as a billboard using direct scaled blitting.
+ * This implements a simple nearest-neighbor scaling by iterating the destination
+ * and sampling from the source sprite using the CLX RLE decoder.
+ */
+void DrawScaledSprite(const Surface &out, const ClxSprite &sprite, int screenX, int screenY,
+                      float distance, const uint8_t *lightTable, int screenWidth, int screenHeight) {
+    if (distance <= 0.1f)
+        return;
+
+    // Scale sprite based on distance
+    constexpr float BASE_SCALE = 1.5f;
+    float scale = BASE_SCALE * (screenHeight / 200.0f) / distance;
+    scale = std::clamp(scale, 0.1f, 5.0f);
+
+    int spriteWidth = static_cast<int>(sprite.width() * scale);
+    int spriteHeight = static_cast<int>(sprite.height() * scale);
+
+    if (spriteWidth <= 0 || spriteHeight <= 0)
+        return;
+
+    // Center horizontally, bottom align vertically
+    int drawX = screenX - spriteWidth / 2;
+    int drawY = screenY - spriteHeight;
+
+    // Check if completely off-screen
+    if (drawX + spriteWidth < 0 || drawX >= screenWidth ||
+        drawY + spriteHeight < 0 || drawY >= screenHeight)
+        return;
+
+    // Simple approach: decode the CLX sprite to a temporary buffer at native size,
+    // then scale-blit to the destination.
+    // For CLX sprites (RLE encoded), we need to decode on-the-fly or use a cache.
+    // For simplicity, we'll implement a basic scaled blit by decoding the sprite
+    // to a temporary buffer first.
+
+    int srcWidth = sprite.width();
+    int srcHeight = sprite.height();
+    const uint8_t *spriteData = sprite.pixelData();
+    uint32_t spriteDataSize = sprite.pixelDataSize();
+
+    // Create a temporary buffer for the decoded sprite
+    std::vector<uint8_t> tempBuffer(srcWidth * srcHeight, 0);
+
+    // Decode the CLX sprite to the temp buffer (bottom-up, like the renderer does)
+    // CLX uses CL2-style RLE encoding
+    const uint8_t *src = spriteData;
+    const uint8_t *srcEnd = src + spriteDataSize;
+
+    // Decode row by row from bottom to top (CL2 format is bottom-up)
+    for (int y = srcHeight - 1; y >= 0; --y) {
+        int x = 0;
+        while (x < srcWidth && src < srcEnd) {
+            uint8_t control = *src++;
+            if (control >= 0xC0) { // Transparent run (0xC0-0xFF)
+                int run = 0x100 - control;
+                x += run;
+                if (x > srcWidth) break;
+            } else if (control >= 0x80) { // Fill run (0x80-0xBF)
+                int run = control - 0x80 + 1;
+                uint8_t color = *src++;
+                for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
+                    tempBuffer[y * srcWidth + x] = color;
+                }
+            } else { // Literal run (0x00-0x7F)
+                int run = control + 1;
+                for (int i = 0; i < run && x < srcWidth; ++i, ++x) {
+                    if (src >= srcEnd) break;
+                    tempBuffer[y * srcWidth + x] = *src++;
+                }
+            }
+        }
+    }
+
+    // Now scale-blit the decoded temp buffer to the screen
+    float xRatio = static_cast<float>(srcWidth) / static_cast<float>(spriteWidth);
+    float yRatio = static_cast<float>(srcHeight) / static_cast<float>(spriteHeight);
+
+    // Clip to screen bounds
+    int clipLeft = std::max(0, -drawX);
+    int clipTop = std::max(0, -drawY);
+    int clipRight = std::min(spriteWidth, screenWidth - drawX);
+    int clipBottom = std::min(spriteHeight, screenHeight - drawY);
+
+    for (int dy = clipTop; dy < clipBottom; ++dy) {
+        int sy = std::min(static_cast<int>((dy + clipTop) * yRatio), srcHeight - 1);
+        for (int dx = clipLeft; dx < clipRight; ++dx) {
+            int sx = std::min(static_cast<int>((dx + clipLeft) * xRatio), srcWidth - 1);
+            uint8_t color = tempBuffer[sy * srcWidth + sx];
+            if (color != 0) { // 0 = transparent
+                if (lightTable != nullptr)
+                    color = lightTable[color];
+                int dstX = drawX + dx;
+                int dstY = drawY + dy;
+                if (dstX >= 0 && dstX < screenWidth && dstY >= 0 && dstY < screenHeight) {
+                    *out.at(dstX, dstY) = color;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Initialize camera from ViewPosition
+ */
+void InitializeCamera(Point viewPosition) {
+    if (!g_cameraInitialized) {
+        g_camera.x = static_cast<float>(viewPosition.x) + 0.5f;
+        g_camera.y = static_cast<float>(viewPosition.y) + 0.5f;
+        g_camera.yaw = 0.0f; // Facing north initially
+        g_camera.pitch = 0.0f;
+        g_cameraInitialized = true;
+    } else {
+        // Smoothly interpolate camera to follow player
+        float targetX = static_cast<float>(viewPosition.x) + 0.5f;
+        float targetY = static_cast<float>(viewPosition.y) + 0.5f;
+        g_camera.x += (targetX - g_camera.x) * 0.15f;
+        g_camera.y += (targetY - g_camera.y) * 0.15f;
+    }
+}
+
+/**
+ * Update camera based on input
+ */
+void UpdateCamera(float deltaTime) {
+    // Rotation
+    g_camera.yaw += g_input.mouseDeltaX * TURN_SPEED * deltaTime;
+    g_camera.pitch = std::clamp(g_camera.pitch - g_input.mouseDeltaY * TURN_SPEED * deltaTime, -static_cast<float>(M_PI) / 2.5f, static_cast<float>(M_PI) / 2.5f);
+    g_input.mouseDeltaX = 0.0f;
+    g_input.mouseDeltaY = 0.0f;
+
+    // Normalize yaw
+    while (g_camera.yaw > M_PI) g_camera.yaw -= 2.0f * M_PI;
+    while (g_camera.yaw < -M_PI) g_camera.yaw += 2.0f * M_PI;
+
+    // Movement
+    float cosYaw = std::cos(g_camera.yaw);
+    float sinYaw = std::sin(g_camera.yaw);
+    float moveX = 0.0f;
+    float moveY = 0.0f;
+
+    if (g_input.forward) {
+        moveX += sinYaw;
+        moveY -= cosYaw;
+    }
+    if (g_input.backward) {
+        moveX -= sinYaw;
+        moveY += cosYaw;
+    }
+    if (g_input.strafeLeft) {
+        moveX -= cosYaw;
+        moveY -= sinYaw;
+    }
+    if (g_input.strafeRight) {
+        moveX += cosYaw;
+        moveY += sinYaw;
+    }
+
+    float speed = MOVE_SPEED * deltaTime;
+    float newX = g_camera.x + moveX * speed;
+    float newY = g_camera.y + moveY * speed;
+
+    // Collision detection - simple AABB vs tile grid
+    constexpr float PLAYER_RADIUS = 0.3f;
+
+    // Check X movement
+    if (!IsWallTile(static_cast<int>(newX - PLAYER_RADIUS), static_cast<int>(g_camera.y + PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(newX + PLAYER_RADIUS), static_cast<int>(g_camera.y + PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(newX - PLAYER_RADIUS), static_cast<int>(g_camera.y - PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(newX + PLAYER_RADIUS), static_cast<int>(g_camera.y - PLAYER_RADIUS))) {
+        g_camera.x = newX;
+    }
+
+    // Check Y movement
+    if (!IsWallTile(static_cast<int>(g_camera.x + PLAYER_RADIUS), static_cast<int>(newY - PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(g_camera.x + PLAYER_RADIUS), static_cast<int>(newY + PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(g_camera.x - PLAYER_RADIUS), static_cast<int>(newY - PLAYER_RADIUS)) &&
+        !IsWallTile(static_cast<int>(g_camera.x - PLAYER_RADIUS), static_cast<int>(newY + PLAYER_RADIUS))) {
+        g_camera.y = newY;
+    }
+}
+
+/**
+ * Cast a single ray and return hit information
+ */
+RayHit CastRay(float rayAngle) {
+    RayHit hit;
+    hit.distance = FAR_PLANE;
+
+    float rayDirX = std::sin(rayAngle);
+    float rayDirY = -std::cos(rayAngle);
+
+    // Current tile
+    int mapX = static_cast<int>(g_camera.x);
+    int mapY = static_cast<int>(g_camera.y);
+
+    // DDA setup
+    float deltaDistX = (rayDirX == 0) ? 1e30f : std::abs(1.0f / rayDirX);
+    float deltaDistY = (rayDirY == 0) ? 1e30f : std::abs(1.0f / rayDirY);
+
+    int stepX, stepY;
+    float sideDistX, sideDistY;
+
+    if (rayDirX < 0) {
+        stepX = -1;
+        sideDistX = (g_camera.x - mapX) * deltaDistX;
+    } else {
+        stepX = 1;
+        sideDistX = (mapX + 1.0f - g_camera.x) * deltaDistX;
+    }
+
+    if (rayDirY < 0) {
+        stepY = -1;
+        sideDistY = (g_camera.y - mapY) * deltaDistY;
+    } else {
+        stepY = 1;
+        sideDistY = (mapY + 1.0f - g_camera.y) * deltaDistY;
+    }
+
+    // DDA loop
+    int side = 0;
+    int prevX = mapX;
+    int prevY = mapY;
+    for (int i = 0; i < MAX_RAY_DISTANCE; ++i) {
+        prevX = mapX;
+        prevY = mapY;
+        if (sideDistX < sideDistY) {
+            sideDistX += deltaDistX;
+            mapX += stepX;
+            side = 0;
+        } else {
+            sideDistY += deltaDistY;
+            mapY += stepY;
+            side = 1;
+        }
+
+        if (IsWallTile(mapX, mapY)) {
+            hit.hitWall = true;
+            hit.hitDoor = IsDoorTile(mapX, mapY);
+            hit.tileX = mapX;
+            hit.tileY = mapY;
+            hit.side = side;
+            hit.distance = (side == 0) ? sideDistX - deltaDistX : sideDistY - deltaDistY;
+            hit.lightTileX = prevX;
+            hit.lightTileY = prevY;
+
+            // Position along the face, [0,1)
+            float wallX = (side == 0) ? g_camera.y + hit.distance * rayDirY
+                                      : g_camera.x + hit.distance * rayDirX;
+            wallX -= std::floor(wallX);
+            hit.textureX = wallX;
+
+            if (mapX >= 0 && mapX < DUNGEON_WIDTH && mapY >= 0 && mapY < DUNGEON_HEIGHT)
+                hit.pieceId = dPiece[mapX][mapY];
+            break;
+        }
+    }
+
+    return hit;
+}
+
+/**
+ * Wolfenstein-style renderer.
+ *
+ * Per screen column: cast one ray (DDA) to find the wall, then for every pixel of that column either
+ *  - sample the wall texture (u from where the ray hit the face, v from the pixel's height in the world), or
+ *  - floor/ceiling-cast: turn the pixel row into a perpendicular depth, walk that far along the ray and
+ *    sample the floor texture at the world position we land on.
+ *
+ * All depths are perpendicular (fisheye-corrected) and the view uses a flat projection plane
+ * (ray angle = atan(cameraX * tan(FOV/2))), so walls and floors line up and straight edges stay straight.
+ */
+void RenderDungeonRaycast(const Surface &out)
+{
+    const int screenWidth = out.w();
+    const int screenHeight = out.h();
+
+    const float tanHalfFov = std::tan(FOV * 0.5f);
+    const float focal = (screenWidth * 0.5f) / tanHalfFov; // pixels; same for x and y (square pixels)
+    const float horizon = screenHeight * 0.5f + std::tan(g_camera.pitch) * focal;
+    const float eye = g_camera.height;
+    const float wallHeight = WallHeight();
+    const float ceilingGap = std::max(wallHeight - eye, 0.01f);
+    const int maxLight = static_cast<int>(std::size(LightTables)) - 1;
+
+    for (int x = 0; x < screenWidth; ++x) {
+        const float cameraX = 2.0f * (x + 0.5f) / screenWidth - 1.0f;
+        const float offset = std::atan(cameraX * tanHalfFov);
+        const float cosOffset = std::cos(offset);
+        const float rayAngle = g_camera.yaw + offset;
+        const float rayDirX = std::sin(rayAngle);
+        const float rayDirY = -std::cos(rayAngle);
+
+        const RayHit hit = CastRay(rayAngle);
+        const float perp = hit.distance * cosOffset; // perpendicular distance
+
+        int wallTop = 1;
+        int wallBottom = 0; // empty span when there's no wall
+        if (hit.hitWall && perp > NEAR_PLANE) {
+            wallBottom = static_cast<int>(horizon + eye * focal / perp);
+            wallTop = static_cast<int>(horizon - ceilingGap * focal / perp);
+        }
+
+        const uint8_t *wallLight = nullptr;
+        if (wallBottom >= wallTop) {
+            // One light table per column, the neighbouring face is a touch darker for depth.
+            int light = GetTileLight(hit.lightTileX, hit.lightTileY) + (hit.side == 1 ? 1 : 0);
+            wallLight = GetLightTable(std::min(light, maxLight));
+        }
+
+        for (int y = 0; y < screenHeight; ++y) {
+            uint8_t color = 0;
+
+            if (y >= wallTop && y <= wallBottom) {
+                // ---- wall ----
+                const float z = eye - (y + 0.5f - horizon) * perp / focal; // world height of this pixel
+                const float v = z / wallHeight;                           // 0 = floor, 1 = top
+                const float u = (hit.side == 0) ? hit.textureX : 1.0f - hit.textureX;
+                if (!FpSampleWall(hit.pieceId, hit.side == 1, u, v, color))
+                    color = 0;
+                color = wallLight[color];
+            } else {
+                // ---- floor / ceiling ----
+                const float dy = (y + 0.5f) - horizon;
+                if (std::abs(dy) < 0.5f) {
+                    *out.at(x, y) = 0;
+                    continue;
+                }
+                const bool isCeiling = dy < 0;
+                const float rowDepth = isCeiling ? ceilingGap * focal / -dy : eye * focal / dy; // perpendicular
+                const float dist = rowDepth / cosOffset;                                       // along the ray
+
+                const float wx = g_camera.x + rayDirX * dist;
+                const float wy = g_camera.y + rayDirY * dist;
+                const int tx = static_cast<int>(std::floor(wx));
+                const int ty = static_cast<int>(std::floor(wy));
+
+                if (tx >= 0 && tx < DUNGEON_WIDTH && ty >= 0 && ty < DUNGEON_HEIGHT && rowDepth < FAR_PLANE) {
+                    // The original has no ceiling art: reuse the floor stone, just darker.
+                    if (!FpSampleFloor(dPiece[tx][ty], wx - tx, wy - ty, color))
+                        color = 0;
+                    const int light = GetTileLight(tx, ty) + (isCeiling ? 4 : 0);
+                    color = GetLightTable(std::min(light, maxLight))[color];
+                }
+            }
+
+            *out.at(x, y) = color;
+        }
+    }
+}
+
+/**
+ * Cast a ray from the crosshair center and update targeting variables.
+ * This mimics the isometric mode's cursor targeting logic.
+ */
+void UpdateCrosshairTarget(int screenWidth, int screenHeight) {
+    // Cast ray from camera center (crosshair position)
+    float rayAngle = g_camera.yaw;
+    RayHit hit = CastRay(rayAngle);
+
+    // Reset cursor variables
+    pcursitem = -1;
+    pcursmonst = -1;
+    pcurstrig = -1;
+    pcursmissile = nullptr;
+    pcursquest = Q_INVALID;
+    ObjectUnderCursor = nullptr;
+    PlayerUnderCursor = nullptr;
+    cursPosition = { -1, -1 };
+
+    if (!hit.hitWall) {
+        return;
+    }
+
+    // Set the cursor position to the hit tile
+    cursPosition = { static_cast<int16_t>(hit.tileX), static_cast<int16_t>(hit.tileY) };
+
+    // Check for items on the hit tile
+    if (hit.tileX >= 0 && hit.tileX < DUNGEON_WIDTH && hit.tileY >= 0 && hit.tileY < DUNGEON_HEIGHT) {
+        int8_t itemIdx = dItem[hit.tileX][hit.tileY];
+        if (itemIdx > 0 && !Items[itemIdx - 1].isEmpty()) {
+            pcursitem = itemIdx - 1;
+        }
+    }
+
+    // Check for objects on the hit tile
+    if (hit.tileX >= 0 && hit.tileX < DUNGEON_WIDTH && hit.tileY >= 0 && hit.tileY < DUNGEON_HEIGHT) {
+        Object *obj = FindObjectAtPosition({ hit.tileX, hit.tileY });
+        if (obj != nullptr && obj->canInteractWith() && !obj->IsDisabled()) {
+            ObjectUnderCursor = obj;
+        }
+    }
+
+    // Check for monsters on the hit tile
+    if (hit.tileX >= 0 && hit.tileX < DUNGEON_WIDTH && hit.tileY >= 0 && hit.tileY < DUNGEON_HEIGHT) {
+        int8_t monsterIdx = dMonster[hit.tileX][hit.tileY];
+        if (monsterIdx != 0) {
+            int mi = std::abs(monsterIdx) - 1;
+            if (mi >= 0 && mi < MaxMonsters) {
+                Monster &monster = Monsters[mi];
+                if (!monster.hasNoLife() && (monster.flags & MFLAG_HIDDEN) == 0 && IsTileLit({ hit.tileX, hit.tileY })) {
+                    if (!monster.isPlayerMinion()) {
+                        pcursmonst = mi;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for triggers/portals on the hit tile
+    for (int i = 0; i < numtrigs; ++i) {
+        if (trigs[i].position.x == hit.tileX && trigs[i].position.y == hit.tileY) {
+            pcurstrig = i;
+            break;
+        }
+    }
+
+    // Check for quest locations
+    for (auto &quest : Quests) {
+        if (quest._qidx != Q_INVALID && currlevel == quest._qlevel && quest._qslvl != 0) {
+            if (quest.position.x == hit.tileX && quest.position.y == hit.tileY) {
+                pcursquest = quest._qidx;
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * Draw the crosshair at screen center with targeting feedback
+ */
+void DrawCrosshair(const Surface &out) {
+    int screenWidth = out.w();
+    int screenHeight = out.h();
+    int centerX = screenWidth / 2;
+    int centerY = screenHeight / 2;
+    int crosshairSize = 8;
+    uint8_t color = 200; // Bright color
+
+    // Change crosshair color based on what we're targeting
+    if (pcursmonst != -1) {
+        color = 220; // Red-ish for monsters
+    } else if (pcursitem != -1) {
+        color = 240; // Yellow-ish for items
+    } else if (ObjectUnderCursor != nullptr) {
+        color = 180; // Green-ish for objects (doors, chests)
+    } else if (cursPosition.x >= 0) {
+        color = 200; // Default for walls
+    }
+
+    // Horizontal line
+    for (int x = centerX - crosshairSize; x <= centerX + crosshairSize; ++x) {
+        if (x != centerX && x >= 0 && x < out.w() && centerY >= 0 && centerY < out.h()) {
+            *out.at(x, centerY) = color;
+        }
+    }
+    // Vertical line
+    for (int y = centerY - crosshairSize; y <= centerY + crosshairSize; ++y) {
+        if (y != centerY && centerX >= 0 && centerX < out.w() && y >= 0 && y < out.h()) {
+            *out.at(centerX, y) = color;
+        }
+    }
+    // Center dot
+    if (centerX >= 0 && centerX < out.w() && centerY >= 0 && centerY < out.h()) {
+        *out.at(centerX, centerY) = color;
+    }
+}
+
+/**
+ * Project a world position to screen coordinates
+ * @param worldX World X position (tile units)
+ * @param worldY World Y position (tile units)
+ * @param screenWidth Screen width
+ * @param screenHeight Screen height
+ * @param outX Output screen X
+ * @param outY Output screen Y
+ * @param outDistance Output distance from camera
+ * @return true if point is in front of camera and within FOV
+ */
+bool ProjectWorldToScreen(float worldX, float worldY, int screenWidth, int screenHeight,
+                          int &outX, int &outY, float &outDistance) {
+    // Vector from camera to object
+    float dx = worldX - g_camera.x;
+    float dy = worldY - g_camera.y;
+
+    // Rotate by camera yaw (inverse rotation)
+    float cosYaw = std::cos(g_camera.yaw);
+    float sinYaw = std::sin(g_camera.yaw);
+    float rotX = dx * cosYaw + dy * sinYaw;
+    float rotY = -dx * sinYaw + dy * cosYaw;
+
+    // Check if behind camera
+    if (rotY <= 0.1f)  // Small epsilon to avoid division by zero
+        return false;
+
+    outDistance = rotY;
+
+    // Calculate screen X from horizontal angle
+    float angle = std::atan2(rotX, rotY);
+    if (std::abs(angle) > FOV / 2.0f + 0.2f)  // Small margin for sprite width
+        return false;
+
+    outX = static_cast<int>(screenWidth / 2 + (angle / (FOV / 2.0f)) * (screenWidth / 2.0f));
+
+    // Calculate screen Y from vertical angle (pitch)
+    // For now, center vertically with pitch offset
+    outY = static_cast<int>(screenHeight / 2 + g_camera.pitch * screenHeight);
+
+    return true;
+}
+
+/**
+ * Render all visible sprites (monsters, players, items) as billboards
+ */
+void RenderSprites(const Surface &out) {
+    int screenWidth = out.w();
+    int screenHeight = out.h();
+
+    // Render monsters
+    for (int i = 0; i < static_cast<int>(ActiveMonsterCount); ++i) {
+        const Monster &monster = Monsters[ActiveMonsters[i]];
+        if (monster.hasNoLife() || (monster.flags & MFLAG_HIDDEN) != 0)
+            continue;
+
+        int screenX, screenY;
+        float distance;
+        if (!ProjectWorldToScreen(
+                static_cast<float>(monster.position.tile.x) + 0.5f,
+                static_cast<float>(monster.position.tile.y) + 0.5f,
+                screenWidth, screenHeight, screenX, screenY, distance))
+            continue;
+
+        // Get current sprite and light table
+        const ClxSprite &sprite = monster.animInfo.currentSprite();
+
+        const uint8_t *lightTable = LightTables[0].data();
+        int lightIdx = GetTileLight(monster.position.tile.x, monster.position.tile.y);
+        if (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
+            lightTable = LightTables[lightIdx].data();
+
+        // Draw scaled sprite with lighting
+        DrawScaledSprite(out, sprite, screenX, screenY, distance, lightTable, screenWidth, screenHeight);
+    }
+
+    // Render items on ground
+    for (int x = 0; x < DUNGEON_WIDTH; ++x) {
+        for (int y = 0; y < DUNGEON_HEIGHT; ++y) {
+            int8_t itemIdx = dItem[x][y];
+            if (itemIdx <= 0) continue;
+
+            const Item &item = Items[itemIdx - 1];
+            if (item.isEmpty()) continue;
+
+            int screenX, screenY;
+            float distance;
+            if (!ProjectWorldToScreen(
+                    static_cast<float>(x) + 0.5f,
+                    static_cast<float>(y) + 0.5f,
+                    screenWidth, screenHeight, screenX, screenY, distance))
+                continue;
+
+            // Use item's sprite
+            const ClxSprite &sprite = item.AnimInfo.currentSprite();
+
+            int lightIdx = GetTileLight(x, y);
+            const uint8_t *lightTable = (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
+                ? LightTables[lightIdx].data() : LightTables[0].data();
+
+            // Draw scaled sprite
+            DrawScaledSprite(out, sprite, screenX, screenY, distance, lightTable, screenWidth, screenHeight);
+        }
+    }
+
+    // Render other players (multiplayer)
+    for (const Player &player : Players) {
+        if (&player == MyPlayer || player.hasNoLife() || !player.isOnActiveLevel())
+            continue;
+
+        int screenX, screenY;
+        float distance;
+        if (!ProjectWorldToScreen(
+                static_cast<float>(player.position.tile.x) + 0.5f,
+                static_cast<float>(player.position.tile.y) + 0.5f,
+                screenWidth, screenHeight, screenX, screenY, distance))
+            continue;
+
+        const ClxSprite &sprite = player.currentSprite();
+
+        int lightIdx = GetTileLight(player.position.tile.x, player.position.tile.y);
+        const uint8_t *lightTable = (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
+            ? LightTables[lightIdx].data() : LightTables[0].data();
+
+        // Draw scaled sprite
+        DrawScaledSprite(out, sprite, screenX, screenY, distance, lightTable, screenWidth, screenHeight);
+    }
+}
+
+/**
+ * Convert camera yaw to the nearest game direction.
+ */
+Direction YawToDirection(float yaw) {
+    while (yaw < 0) yaw += 2.0f * M_PI;
+    while (yaw >= 2.0f * M_PI) yaw -= 2.0f * M_PI;
+
+    const float sector = M_PI / 4.0f;
+    int sectorIdx = static_cast<int>((yaw + sector / 2.0f) / sector) % 8;
+
+    static const Direction sectorToDir[8] = {
+        Direction::North,
+        Direction::NorthEast,
+        Direction::East,
+        Direction::SouthEast,
+        Direction::South,
+        Direction::SouthWest,
+        Direction::West,
+        Direction::NorthWest
+    };
+
+    return sectorToDir[sectorIdx];
+}
+
+void SendFPWalkCommand(Direction dir) {
+    if (MyPlayer == nullptr)
+        return;
+
+    // Calculate target tile based on direction
+    Point target = MyPlayer->position.tile;
+    switch (dir) {
+        case Direction::North:    target.y -= 1; break;
+        case Direction::South:    target.y += 1; break;
+        case Direction::West:     target.x -= 1; break;
+        case Direction::East:     target.x += 1; break;
+        case Direction::NorthWest: target.x -= 1; target.y -= 1; break;
+        case Direction::NorthEast: target.x += 1; target.y -= 1; break;
+        case Direction::SouthWest: target.x -= 1; target.y += 1; break;
+        case Direction::SouthEast: target.x += 1; target.y += 1; break;
+        default: return;
+    }
+
+    // Check if target is valid
+    if (InDungeonBounds(target) && PosOkPlayer(*MyPlayer, target)) {
+        NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, target);
+    }
+}
+void ProcessFPInput(const SDL_Event &event) {
+    if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+        bool pressed = (event.type == SDL_KEYDOWN);
+        SDL_Keycode key = event.key.keysym.sym;
+
+        switch (key) {
+            case SDLK_w: g_input.forward = pressed; break;
+            case SDLK_s: g_input.backward = pressed; break;
+            case SDLK_a: g_input.strafeLeft = pressed; break;
+            case SDLK_d: g_input.strafeRight = pressed; break;
+            case SDLK_SPACE: g_input.up = pressed; break;
+            case SDLK_LCTRL: g_input.down = pressed; break;
+        }
+    } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        // Always process mouse motion for FPS-style mouselook
+        // When in relative mode, xrel/yrel are already relative movements
+        // Accumulate deltas — multiple MOUSEMOTION events can arrive per frame
+        if (g_relativeMouseMode || g_camera.mouseLookEnabled) {
+            constexpr float MOUSE_SENSITIVITY = 0.003f;
+            g_input.mouseDeltaX += static_cast<float>(event.motion.xrel) * MOUSE_SENSITIVITY;
+            g_input.mouseDeltaY += static_cast<float>(event.motion.yrel) * MOUSE_SENSITIVITY;
+        }
+    }
+}
+
+} // namespace
+
+void DrawFirstPersonView(const Surface &out, Point startPosition) {
+    // Initialize/update camera
+    InitializeCamera(startPosition);
+
+    // Enable relative mouse mode for FPS-style mouselook
+    // This is idempotent — SDL_SetRelativeMouseMode(SDL_TRUE) is a no-op if already active
+    // scrollrt.cpp disables it when switching back to isometric mode
+    g_relativeMouseMode = true;
+    SDL_SetRelativeMouseMode(SDL_TRUE);
+
+    // Get delta time (approximate - using fixed 1/20s for game tick)
+    static uint32_t lastTicks = 0;
+    uint32_t currentTicks = SDL_GetTicks();
+    float deltaTime = (lastTicks > 0) ? (currentTicks - lastTicks) / 1000.0f : 0.05f;
+    deltaTime = std::clamp(deltaTime, 0.0f, 0.1f); // Cap at 100ms
+    lastTicks = currentTicks;
+
+    UpdateCamera(deltaTime);
+
+    // Clear screen
+    FillRect(out, 0, 0, out.w(), out.h(), 0);
+
+    // Render dungeon via raycasting
+    RenderDungeonRaycast(out);
+
+    // Render sprites (monsters, items, players) as billboards
+    RenderSprites(out);
+
+    // Update crosshair targeting (sets cursPosition, pcursmonst, pcursitem, etc.)
+    UpdateCrosshairTarget(out.w(), out.h());
+
+    // Draw crosshair at screen center
+    DrawCrosshair(out);
+
+    // Debug info
+    DrawString(out, "FPS MODE | Pos: (" + std::to_string(g_camera.x) + ", " + std::to_string(g_camera.y) + ") Yaw: " + std::to_string(g_camera.yaw),
+        Rectangle { Point { 10, 10 }, Size { 400, 16 } },
+        { .flags = UiFlags::ColorWhite });
+
+    // Show what we're targeting
+    std::string targetInfo = "Target: ";
+    if (pcursmonst != -1) {
+        targetInfo += "Monster [" + std::to_string(pcursmonst) + "]";
+    } else if (pcursitem != -1) {
+        targetInfo += "Item [" + std::to_string(pcursitem) + "]";
+    } else if (ObjectUnderCursor != nullptr) {
+        if (ObjectUnderCursor->isDoor()) {
+            float dx = g_camera.x - (cursPosition.x + 0.5f);
+            float dy = g_camera.y - (cursPosition.y + 0.5f);
+            int dist = static_cast<int>(std::sqrt(dx * dx + dy * dy) + 0.5f);
+            targetInfo += "DOOR (dist: " + std::to_string(dist) + ")";
+        } else {
+            targetInfo += "Object";
+        }
+    } else if (cursPosition.x >= 0) {
+        targetInfo += "Wall";
+    } else {
+        targetInfo += "None";
+    }
+    DrawString(out, targetInfo,
+        Rectangle { Point { 10, 50 }, Size { 500, 16 } },
+        TextRenderOptions { .flags = UiFlags::ColorBlue });
+
+    DrawString(out, "WASD=Move | Mouse=Look | F6=Toggle | LMB=Interact",
+        Rectangle { Point { 10, 30 }, Size { 500, 16 } },
+        { .flags = UiFlags::ColorYellow });
+}
+
+/**
+ * Handle input events for first-person mode
+ * Call this from the main event loop
+ */
+void HandleFirstPersonInput(const SDL_Event &event) {
+    ProcessFPInput(event);
+
+    // Handle LMB click for interaction in FP mode
+    if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+        // Trigger interaction at crosshair position
+        if (cursPosition.x >= 0 && cursPosition.y >= 0) {
+            // Check if we're close enough to interact (for doors, need to be adjacent)
+            float dx = g_camera.x - (cursPosition.x + 0.5f);
+            float dy = g_camera.y - (cursPosition.y + 0.5f);
+            float distSq = dx * dx + dy * dy;
+
+            // For doors, require being within ~1.5 tiles
+            bool canInteract = true;
+            if (ObjectUnderCursor != nullptr && ObjectUnderCursor->isDoor()) {
+                canInteract = (distSq <= 2.25f); // 1.5 tiles squared
+            }
+
+            if (canInteract) {
+                // Call the same interaction logic as isometric mode
+                PerformPrimaryAction();
+            }
+        }
+    }
+}
+
+} // namespace devilution
