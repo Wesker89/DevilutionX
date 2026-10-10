@@ -45,6 +45,14 @@ void ClearFirstPersonMouseDeltas();
 void ToggleFirstPersonGeometryDebug();
 
 /**
+ * @brief Toggle the test texture view (checkerboard pattern).
+ *
+ * Developer-only, off by default. Bound to F5. Verifies the texture
+ * sampling and rendering pipeline without asset dependencies.
+ */
+void ToggleFirstPersonTestTexture();
+
+/**
  * @brief Reconcile the FPS camera with the authoritative player position.
  *
  * Called when entering FPS mode (and when the level changes underneath

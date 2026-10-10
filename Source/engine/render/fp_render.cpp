@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <array>
 #include <vector>
 
@@ -67,6 +68,11 @@ bool g_cameraInitialized = false;
 // contrasting flat color so layout problems show without texture noise.
 bool g_geoDebug = false;
 
+// Developer-only test texture: renders a checkerboard pattern instead of
+// game textures. Off by default; toggled with F7. Verifies the texture
+// sampling and rendering pipeline without asset dependencies.
+bool g_testTexture = false;
+
 // FPS mouse look state
 bool g_relativeMouseMode = false;
 
@@ -95,9 +101,21 @@ constexpr int MAX_RAY_DISTANCE = 50; // tiles
 constexpr int DUNGEON_WIDTH = MAXDUNX;
 constexpr int DUNGEON_HEIGHT = MAXDUNY;
 
-// Wall height in tile units
-constexpr float WALL_HEIGHT = 2.5f;
-constexpr float CEILING_HEIGHT = WALL_HEIGHT;
+// Wall height in tile units.
+//
+// The wall art stack is `(MicroTileLen - 2) / 2` bands of 32 rows. A face is
+// 32 art pixels wide for a one-tile-wide tile, so one band (32 rows) is one
+// world unit tall and the art texels are square: level 1 walls (10 micro
+// tiles) are four units tall; town (16 micro tiles) are seven units tall.
+// Verified against DrawCell (scrollrt.cpp) and the frame geometry in dun_tile.hpp.
+DVL_ALWAYS_INLINE float GetWallHeight()
+{
+	return (MicroTileLen > 2) ? static_cast<float>((MicroTileLen - 2) / 2) : 0.0f;
+}
+DVL_ALWAYS_INLINE float GetCeilingHeight()
+{
+	return GetWallHeight();
+}
 
 // Eye height above the floor in tile units. The floor caster assumes
 // this (rowDistance = EYE_HEIGHT * screenHeight / p), so the wall
@@ -232,15 +250,21 @@ struct RayHit {
     int lightTableIndex = 0;
     TileType tileType = TileType::Square;
     uint16_t pieceId = 0; // dPiece id of the hit tile, for wall-stack lookup
+    // Outward normal of the face that was hit. Only one component is set.
+    // Engine convention: +x = east, +y = south, so a hit with normal
+    // (0, +1) is the tile's south face and (+1, 0) its east face.
+    int normalX = 0;
+    int normalY = 0;
 };
 
 /**
  * Check if a tile is solid (wall)
+ * Matches the isometric renderer's IsWall logic: solid OR block missile OR special.
  */
 bool IsWallTile(int x, int y) {
     if (x < 0 || x >= DUNGEON_WIDTH || y < 0 || y >= DUNGEON_HEIGHT)
         return true; // Out of bounds = solid
-    return TileHasAny({ x, y }, TileProperties::Solid);
+    return TileHasAny({ x, y }, TileProperties::Solid | TileProperties::BlockMissile) || dSpecial[x][y] != 0;
 }
 
 /**
@@ -513,6 +537,16 @@ RayHit CastRay(float rayAngle) {
             hit.side = side;
             hit.distance = (side == 0) ? sideDistX - deltaDistX : sideDistY - deltaDistY;
             hit.lightTableIndex = GetTileLight(mapX, mapY);
+            // Outward normal of the crossed boundary. `stepX`/`stepY` point
+            // from the camera towards the hit tile, so the face we see is on
+            // the opposite side of that step direction.
+            if (side == 0) {
+                hit.normalX = (stepX > 0) ? -1 : 1;
+                hit.normalY = 0;
+            } else {
+                hit.normalX = 0;
+                hit.normalY = (stepY > 0) ? -1 : 1;
+            }
 
             // Calculate texture coordinate
             float wallX;
@@ -544,6 +578,85 @@ RayHit CastRay(float rayAngle) {
 }
 
 /**
+ * Sample the wall art for one face of a wall tile.
+ *
+ * Layout (verified against DrawCell in scrollrt.cpp and the frame geometry
+ * in dun_tile.hpp / dun_render.cpp, using real L1 MIN + CEL data):
+ *
+ * A tile is drawn as a 64x32 cell of two 32-wide columns. The left column
+ * (`mt[0], mt[2], mt[4], ...`) holds the art for the tile's SOUTH face
+ * (Y = ty + 1), the right column (`mt[1], mt[3], mt[5], ...`) the art for
+ * the tile's EAST face (X = tx + 1). Those are the only faces the original
+ * isometric camera can see, so they are the only ones with art; north and
+ * west faces reuse the opposite column.
+ *
+ * Each column is a stack of `bands = (MicroTileLen - 2) / 2` bands of 32
+ * rows, band 0 at the tile's floor level. One band is one world unit tall
+ * (a face is 32 art pixels wide for a one-tile-wide tile), which is why
+ * GetWallHeight() equals the band count.
+ *
+ * The isometric projection shears a vertical face by 16 rows across its
+ * 32-pixel width, so the art row a face point samples depends on the
+ * horizontal position `u` (measured from the face's west end for south and
+ * north faces, from its north end for east and west faces):
+ *
+ *   south face: cellY = 16 + 16*u - 32*height
+ *   east  face: cellY = 32 - 16*u - 32*height
+ *
+ * where cellY is measured in art rows from the top of the base band's box
+ * and height is the world height above the floor. cellY then selects the
+ * band and the row inside it.
+ *
+ * @param pieceId       dPiece id of the wall tile
+ * @param eastFaceColumn true to read the east-face column (right column)
+ * @param u             horizontal position across the face, [0, 1]
+ * @param v             height above the floor as a fraction of GetWallHeight()
+ * @param outColor      receives the palette index
+ * @return true when real art was sampled
+ */
+bool SampleWallFaceArt(uint16_t pieceId, bool eastFaceColumn, float u, float v, uint8_t &outColor)
+{
+    const int bands = MicroTileLen > 2 ? (static_cast<int>(MicroTileLen) - 2) / 2 : 0;
+    if (bands <= 0 || pieceId == 0 || pieceId >= MAXTILES)
+        return false;
+
+    u = std::clamp(u, 0.0f, 1.0f);
+    v = std::clamp(v, 0.0f, 1.0f);
+    const float height = v * static_cast<float>(bands);
+    const float cellY = (eastFaceColumn ? 32.0f - 16.0f * u : 16.0f + 16.0f * u)
+        - 32.0f * height;
+
+    int band = (31 - static_cast<int>(cellY)) / 32;
+    band = std::clamp(band, 0, bands - 1);
+
+    // Preferred column first, then the opposite one: several pieces only
+    // author one face (real L1 data: 50 pieces have art solely in the left
+    // column, 48 solely in the right), so the opposite column keeps the
+    // face textured instead of falling back to a flat color.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const int column = (attempt == 0) == eastFaceColumn ? 1 : 0;
+        // Walk down to the nearest band that has usable art so the top of
+        // the wall (often a TransparentSquare cap) stays textured.
+        for (int b = band; b >= 0; --b) {
+            const LevelCelBlock block { DPieceMicros[pieceId].mt[2 + 2 * b + column] };
+            if (!block.hasValue() || block.type() == TileType::TransparentSquare)
+                continue;
+            const uint8_t *frameData = GetDunFrame(pDungeonCels.get(), block.frame());
+            if (frameData == nullptr)
+                continue;
+            // Compute row within the found band b (not the initial band).
+            const int rowInFoundBand = std::clamp(static_cast<int>(cellY) + 32 * b, 0, 31);
+            const float frameV = (block.type() == TileType::LeftTriangle || block.type() == TileType::RightTriangle)
+                    ? (rowInFoundBand + 0.5f) / static_cast<float>(DunFrameTriangleHeight)
+                    : (rowInFoundBand + 0.5f) / static_cast<float>(DunFrameHeight);
+            outColor = SampleDungeonTexture(frameData, block.type(), u, frameV);
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Draw a vertical slice (column) of the wall
  */
 void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int screenWidth, int screenHeight) {
@@ -554,11 +667,12 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
     float correctedDist = hit.distance * std::cos(g_camera.yaw - (g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV));
 
     // Calculate wall height on screen.
-    // The wall spans world heights [0, WALL_HEIGHT]; the eye sits
+    // The wall spans world heights [0, GetWallHeight()]; the eye sits
     // EYE_HEIGHT above the floor, so the base projects EYE_HEIGHT/dist
-    // below the horizon and the top (WALL_HEIGHT - EYE_HEIGHT)/dist above.
+    // below the horizon and the top (GetWallHeight() - EYE_HEIGHT)/dist above.
     // This matches the floor caster, so wall bases meet floors exactly.
-    int drawStart = static_cast<int>(screenHeight / 2 - ((WALL_HEIGHT - EYE_HEIGHT) / correctedDist) * screenHeight + g_camera.pitch * screenHeight);
+    const float wallHeight = GetWallHeight();
+    int drawStart = static_cast<int>(screenHeight / 2 - ((wallHeight - EYE_HEIGHT) / correctedDist) * screenHeight + g_camera.pitch * screenHeight);
     int drawEnd = static_cast<int>(screenHeight / 2 + (EYE_HEIGHT / correctedDist) * screenHeight + g_camera.pitch * screenHeight);
 
     drawStart = std::max(0, drawStart);
@@ -572,82 +686,73 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
         ? LightTables[hit.lightTableIndex].data()
         : LightTables[0].data();
 
-    // Wall art lives in the micro-tile stack above the floor pair:
-    // mt[0],mt[1] = floor triangles, mt[2..MicroTileLen) = wall layers
-    // (left/right frame pairs going upward, like DrawCell in scrollrt.cpp).
+    // Wall art lives in the micro-tile stack above the floor pair.
+    //
+    // Verified against DrawCell (scrollrt.cpp): a tile is drawn as a 64x32
+    // cell made of two 32-wide columns. The LEFT column (mt[0], mt[2], ...)
+    // holds the art for the tile's SOUTH face (Y = ty + 1) and the RIGHT
+    // column (mt[1], mt[3], ...) the art for the tile's EAST face
+    // (X = tx + 1) — the only two faces the original isometric camera can
+    // ever see, so they are the only ones with art. North and west faces
+    // reuse the opposite column's art.
+    //
+    // Each column is a stack of bands 32 rows tall. Because the isometric
+    // projection shears a vertical face by 16 rows across its 32-pixel
+    // width, the art row a face point samples depends on the horizontal
+    // position u (see SampleWallFaceArt).
     const int numLayers = MicroTileLen > 2 ? (static_cast<int>(MicroTileLen) - 2) / 2 : 0;
+
+    const Object *wallDoorObj = nullptr;
+    if (g_geoDebug && hit.tileX >= 0 && hit.tileY >= 0) {
+        // Geometry-only diagnostic: door tiles read green. Looked up once
+        // per column instead of per pixel.
+        wallDoorObj = FindObjectAtPosition({ hit.tileX, hit.tileY });
+        if (wallDoorObj != nullptr && !wallDoorObj->isDoor())
+            wallDoorObj = nullptr;
+    }
 
     // Draw vertical line with texture sampling
     for (int y = drawStart; y <= drawEnd; ++y) {
-        float v = (y - drawStart) / static_cast<float>(drawEnd - drawStart);
-        float u = hit.textureX;
-
-        // Select the wall layer frame for this height.
-        // v = 0 at the top of the wall column, v = 1 at the base.
-        // mt[2] is the bottom layer, so the top of the screen maps to
-        // the topmost layer. Each layer is authored as a left/right frame
-        // PAIR drawn side-by-side by DrawCell — but real MIN data shows
-        // the odd slot is often empty (e.g. L1 pieces 0, 2, 12), in which
-        // case the single frame spans the whole face (mirrored on the
-        // right half so texel density and the center seam stay clean)
-        // instead of falling back to a flat color for half the wall.
-        const uint8_t *frameData = nullptr;
-        TileType frameType = hit.tileType;
-        int frameId = hit.textureId;
-        if (hit.pieceId > 0 && numLayers > 0) {
-            const float h = v * numLayers;
-            const int layerFromTop = std::min(static_cast<int>(h), numLayers - 1);
-            const int layerFromBottom = numLayers - 1 - layerFromTop;
-            const float subV = 1.0f - (h - static_cast<float>(layerFromTop)); // 1 at layer top
-            const LevelCelBlock leftBlock { DPieceMicros[hit.pieceId].mt[2 + 2 * layerFromBottom] };
-            const LevelCelBlock rightBlock { DPieceMicros[hit.pieceId].mt[2 + 2 * layerFromBottom + 1] };
-            const bool leftOk = leftBlock.hasValue() && leftBlock.type() != TileType::TransparentSquare;
-            const bool rightOk = rightBlock.hasValue() && rightBlock.type() != TileType::TransparentSquare;
-            const bool rightHalf = u >= 0.5f;
-            if (leftOk && rightOk) {
-                const LevelCelBlock &wallBlock = rightHalf ? rightBlock : leftBlock;
-                frameId = wallBlock.frame();
-                frameType = wallBlock.type();
-                frameData = GetDunFrame(pDungeonCels.get(), frameId);
-                v = std::clamp(subV, 0.0f, 1.0f);
-                u = std::clamp(rightHalf ? (u - 0.5f) * 2.0f : u * 2.0f, 0.0f, 1.0f);
-            } else if (leftOk || rightOk) {
-                const LevelCelBlock &wallBlock = leftOk ? leftBlock : rightBlock;
-                frameId = wallBlock.frame();
-                frameType = wallBlock.type();
-                frameData = GetDunFrame(pDungeonCels.get(), frameId);
-                v = std::clamp(subV, 0.0f, 1.0f);
-                // Mirror across the middle so the seam is continuous.
-                u = std::clamp(rightHalf ? 1.0f - (u - 0.5f) * 2.0f : u * 2.0f, 0.0f, 1.0f);
-            }
-        }
-        if (frameData == nullptr && hit.textureId > 0) {
-            frameData = GetDunFrame(pDungeonCels.get(), hit.textureId);
-        }
+        // v = 0 at the base of the wall column, 1 at the top.
+        const float v = 1.0f - (y - drawStart) / static_cast<float>(drawEnd - drawStart);
+        const float u = hit.textureX;
 
         // Sample texture from dungeon CEL data
         uint8_t color;
         if (g_geoDebug) {
             // Geometry-only diagnostic: flat color per wall orientation.
-            // Door tiles (real door objects, not dSpecial arches) read green.
             // No textures, no lighting.
-            const Object *wallObj = FindObjectAtPosition({ hit.tileX, hit.tileY });
-            if (wallObj != nullptr && wallObj->isDoor())
+            if (wallDoorObj != nullptr)
                 color = 180;
             else if (hit.side == 0)
                 color = 200;
             else
                 color = 150;
-        } else if (frameData != nullptr && frameType != TileType::TransparentSquare) {
-            color = SampleDungeonTexture(frameData, frameType, u, v);
-            g_diagWallTex++;
-            g_lastWallTile = { hit.tileX, hit.tileY };
-            g_lastWallFrame = frameId;
-            g_lastWallPiece = hit.pieceId;
+        } else if (g_testTexture) {
+            // Test texture: checkerboard pattern to verify UV mapping and
+            // rendering pipeline without asset dependencies.
+            const int checkSize = 8;
+            const int checkU = static_cast<int>(u * checkSize * 4) % (checkSize * 2);
+            const int checkV = static_cast<int>(v * checkSize * 4) % (checkSize * 2);
+            color = ((checkU < checkSize) == (checkV < checkSize)) ? 200 : 50;
         } else {
-            // Fallback color
-            color = GetWallBaseColor(frameId, hit.hitDoor);
-            g_diagWallFallback++;
+            // Which of the piece's two face columns the camera is looking
+            // at, derived from the face normal.
+            const bool eastFaceColumn = (hit.normalX == 1) || (hit.normalY == -1);
+            uint8_t artColor = 0;
+            const bool hasArt = numLayers > 0 && hit.pieceId > 0
+                && SampleWallFaceArt(hit.pieceId, eastFaceColumn, u, v, artColor);
+            if (hasArt) {
+                color = artColor;
+                g_diagWallTex++;
+                g_lastWallTile = { hit.tileX, hit.tileY };
+                g_lastWallFrame = 0;
+                g_lastWallPiece = hit.pieceId;
+            } else {
+                // Fallback color
+                color = GetWallBaseColor(hit.textureId, hit.hitDoor);
+                g_diagWallFallback++;
+            }
         }
 
         // Apply lighting
@@ -669,13 +774,25 @@ void DrawWallColumn(const Surface &out, int screenX, const RayHit &hit, int scre
 
 /**
  * Sample the floor art for a world position.
- * Floors are the mt[0]/mt[1] triangle pair of the tile's piece.
- * Like DrawFloorTile in scrollrt.cpp, the frames are always interpreted
- * as Left/RightTriangle art regardless of the MIN-declared block type,
- * because several floor pieces declare a Square type over triangle data
- * (sampling those as squares reads out of bounds and shows garbage).
- * The left triangle covers the left half of the tile square, the right
- * triangle the right half. Returns 0 when no usable art exists.
+ *
+ * Floors are the mt[0]/mt[1] triangle pair of the tile's piece, which
+ * DrawFloorTile (scrollrt.cpp) always interprets as Left/RightTriangle
+ * regardless of the MIN-declared block type.
+ *
+ * The tile's square footprint projects into a 64x32 cell as
+ *
+ *   cellX = 32*(dx - dy) + 32,   cellY = 16*(dx + dy)
+ *
+ * with (dx, dy) the fractional position inside the tile. The left triangle
+ * art (mt[0]) covers the half with cellX < 32 (dx < dy), the right triangle
+ * art (mt[1]) the other half; the split follows the tile's diagonal, not a
+ * vertical cut at the tile's middle. Triangle rows are 31 rows tall with
+ * widths 2,4,...,32,...,2, stored bottom-up; the left rows are right
+ * aligned (stored pixel 0 is the row's east end) and the right rows are
+ * left aligned, so the stored column index is derived from the row's own
+ * extent rather than from the fixed 32-wide box.
+ *
+ * Returns 0 when no usable art exists.
  */
 uint8_t SampleFloorAt(float worldX, float worldY, int *outLightTableIndex)
 {
@@ -691,18 +808,31 @@ uint8_t SampleFloorAt(float worldX, float worldY, int *outLightTableIndex)
     if (outLightTableIndex != nullptr)
         *outLightTableIndex = dLight[tileX][tileY];
 
-    const float fracX = worldX - std::floor(worldX);
-    const float fracY = worldY - std::floor(worldY);
-    // Left triangle covers the left half of the tile, right triangle the right half.
-    const bool leftHalf = fracX < 0.5f;
+    const float dx = worldX - std::floor(worldX);
+    const float dy = worldY - std::floor(worldY);
+    const float cellX = 32.0f * (dx - dy) + 32.0f;
+    const float cellY = 16.0f * (dx + dy);
+    const bool leftHalf = cellX < 32.0f;
+
     const LevelCelBlock floorBlock { DPieceMicros[pieceId].mt[leftHalf ? 0 : 1] };
     if (!floorBlock.hasValue() || floorBlock.type() == TileType::TransparentSquare)
         return 0;
-    const float u = leftHalf ? fracX * 2.0f : (fracX - 0.5f) * 2.0f;
-    // Triangle row 0 is the south tip of the isometric diamond, which sits
-    // at the south edge of the top-down tile square (fracY = 1).
-    const float v = 1.0f - fracY;
     const TileType triType = leftHalf ? TileType::LeftTriangle : TileType::RightTriangle;
+
+    // Triangle rows are 0..30 bottom-up; the diamond is 32 rows tall, so the
+    // top and bottom sample rows clamp onto the tip rows.
+    // cellY increases north-to-south (0=north tip, 32=south tip), but triangle
+    // rows are stored bottom-up (row 0 = south tip). Invert the row index.
+    const int row = std::clamp(30 - static_cast<int>(cellY), 0, static_cast<int>(DunFrameTriangleHeight) - 1);
+    const int width = TriangleRowWidth(row);
+    // Position across the row's own extent: right-aligned rows (left art)
+    // end at the box's right edge, left-aligned rows (right art) start at
+    // the box's left edge. Use center-of-pixel sampling: (pos + 0.5) / width.
+    const float u = leftHalf
+        ? std::clamp((cellX - (32.0f - width) + 0.5f) / static_cast<float>(width), 0.0f, 1.0f)
+        : std::clamp((cellX - 32.0f + 0.5f) / static_cast<float>(width), 0.0f, 1.0f);
+    const float v = (row + 0.5f) / static_cast<float>(DunFrameTriangleHeight);
+
     g_lastFloorTile = { tileX, tileY };
     g_lastFloorFrame = floorBlock.frame();
     return SampleDungeonTexture(GetDunFrame(pDungeonCels.get(), floorBlock.frame()), triType, u, v);
@@ -711,104 +841,131 @@ uint8_t SampleFloorAt(float worldX, float worldY, int *outLightTableIndex)
 /**
  * Draw floor and ceiling with textured rendering
  */
-void DrawFloorCeiling(const Surface &out, int screenX, const RayHit &hit, int screenWidth, int screenHeight) {
+void DrawFloorCeiling(const Surface &out, int screenX, int screenWidth, int screenHeight) {
     int horizon = screenHeight / 2 + static_cast<int>(g_camera.pitch * screenHeight);
 
     // Light table fallback (per-pixel tables override this below)
     const uint8_t *cameraLightTable = LightTables[0].data();
 
+    const float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
+    const float rayDirX = std::sin(rayAngle);
+    const float rayDirY = -std::cos(rayAngle);
+    // Angle of this column relative to the view direction, used to convert a
+    // perpendicular distance into a ray length.
+    const float cosCol = std::cos(rayAngle - g_camera.yaw);
+
+    // Door lookup cache for the geometry diagnostic: adjacent pixels usually
+    // land on the same tile.
+    Point cachedTile { -1, -1 };
+    Object *cachedDoor = nullptr;
+
     for (int y = 0; y < screenHeight; ++y) {
         uint8_t color = 0;
         const uint8_t *lightTable = cameraLightTable;
+
+        // Row distance below (floor) or above (ceiling) the horizon.
+        const float p = (y < horizon) ? (horizon - y) : (y - screenHeight / 2 - g_camera.pitch * screenHeight);
 
         if (g_geoDebug) {
             // Geometry-only diagnostic: flat colors, no textures/lighting.
             // Walkable floor = neutral gray, solid = dark, out of bounds =
             // black, door tiles = green, ceiling = near-black.
-            float p = (y < horizon) ? (horizon - y) : (y - screenHeight / 2 - g_camera.pitch * screenHeight);
-            if (p == 0) p = 1;
-            const float rowDistance = (EYE_HEIGHT * screenHeight) / p;
-            const float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
-            const float wx = g_camera.x + std::sin(rayAngle) * rowDistance;
-            const float wy = g_camera.y - std::cos(rayAngle) * rowDistance;
+            if (p <= 0.001f) {
+                if (y < horizon) {
+                    color = 8;
+                }
+                *out.at(screenX, y) = color;
+                continue;
+            }
             if (y < horizon) {
                 color = 8;
+                *out.at(screenX, y) = color;
+                continue;
+            }
+            const float rowDistance = (EYE_HEIGHT * screenHeight) / p;
+            const float t = rowDistance / cosCol;
+            const float wx = g_camera.x + rayDirX * t;
+            const float wy = g_camera.y + rayDirY * t;
+            const Point tile { static_cast<int>(std::floor(wx)), static_cast<int>(std::floor(wy)) };
+            if (!InDungeonBounds(tile)) {
+                color = 0;
             } else {
-                const Point tile { static_cast<int>(std::floor(wx)), static_cast<int>(std::floor(wy)) };
-                if (!InDungeonBounds(tile)) {
-                    color = 0;
+                if (tile != cachedTile) {
+                    cachedTile = tile;
+                    Object *obj = FindObjectAtPosition(tile);
+                    cachedDoor = (obj != nullptr && obj->isDoor()) ? obj : nullptr;
+                }
+                if (cachedDoor != nullptr) {
+                    color = 180;
+                } else if (IsTileWalkable(tile)) {
+                    color = 96;
                 } else {
-                    const Object *obj = FindObjectAtPosition(tile);
-                    if (obj != nullptr && obj->isDoor()) {
-                        color = 180;
-                    } else if (IsTileWalkable(tile)) {
-                        color = 96;
-                    } else {
-                        color = 16;
-                    }
-                    // Tile-grid overlay: brighten pixels near tile borders
-                    // so alignment, corners and doorways can be inspected.
-                    const float fx = wx - std::floor(wx);
-                    const float fy = wy - std::floor(wy);
-                    if (fx < 0.04f || fx > 0.96f || fy < 0.04f || fy > 0.96f) {
-                        color = 200;
-                    }
+                    color = 16;
+                }
+                // Tile-grid overlay: brighten pixels near tile borders
+                // so alignment, corners and doorways can be inspected.
+                const float fx = wx - std::floor(wx);
+                const float fy = wy - std::floor(wy);
+                if (fx < 0.04f || fx > 0.96f || fy < 0.04f || fy > 0.96f) {
+                    color = 200;
                 }
             }
             *out.at(screenX, y) = color;
             continue;
         }
 
+        if (p <= 0.001f)
+            continue;
+
         if (y < horizon) {
             // Ceiling rendering.
             // The original game has no ceiling art, so this stays a dark
             // procedural placeholder until a later milestone.
-            float p = horizon - y;
-            if (p == 0) p = 1;
-            float posZ = EYE_HEIGHT * screenHeight;
-            float rowDistance = posZ / p;
+            const float ceilingHeight = GetCeilingHeight();
+            const float rowDistance = ((ceilingHeight - EYE_HEIGHT) * screenHeight) / p;
+            const float t = rowDistance / cosCol;
 
-            // Calculate world position for this ceiling pixel
-            float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
-            float rayDirX = std::sin(rayAngle);
-            float rayDirY = -std::cos(rayAngle);
-
-            float floorX = g_camera.x + rayDirX * rowDistance;
-            float floorY = g_camera.y + rayDirY * rowDistance;
+            const float floorX = g_camera.x + rayDirX * t;
+            const float floorY = g_camera.y + rayDirY * t;
 
             // Simple ceiling texture - dark with subtle pattern
-            int texX = static_cast<int>(floorX * 16) & 63;
-            int texY = static_cast<int>(floorY * 16) & 63;
+            const int texX = static_cast<int>(floorX * 16) & 63;
+            const int texY = static_cast<int>(floorY * 16) & 63;
             color = static_cast<uint8_t>(16 + ((texX + texY) & 15));
 
             // Distance fade
-            float fade = 1.0f - std::min(rowDistance / FAR_PLANE, 1.0f);
+            const float fade = 1.0f - std::min(rowDistance / FAR_PLANE, 1.0f);
             color = static_cast<uint8_t>(color * fade * 0.5f); // Ceiling darker
 
         } else {
             // Floor rendering
-            float p = y - screenHeight / 2 - g_camera.pitch * screenHeight;
-            if (p == 0) continue;
-            float posZ = EYE_HEIGHT * screenHeight;
-            float rowDistance = posZ / p;
+            // Perpendicular distance from the eye to the floor for this row
+            // (similar triangles with the image plane). The world point on
+            // this column's ray is then at t = rowDistance / cos(colAngle),
+            // the same fisheye correction the wall columns apply, so floors
+            // and walls stay on one consistent camera model.
+            const float rowDistance = (EYE_HEIGHT * screenHeight) / p;
+            const float t = rowDistance / cosCol;
 
-            // Calculate world position for this floor pixel
-            float rayAngle = g_camera.yaw - FOV / 2 + (screenX / static_cast<float>(screenWidth)) * FOV;
-            float rayDirX = std::sin(rayAngle);
-            float rayDirY = -std::cos(rayAngle);
+            const float floorX = g_camera.x + rayDirX * t;
+            const float floorY = g_camera.y + rayDirY * t;
 
-            float floorX = g_camera.x + rayDirX * rowDistance;
-            float floorY = g_camera.y + rayDirY * rowDistance;
-
-            // Sample the art of the tile under this pixel (per-pixel lookup,
-            // so each tile shows its own floor texture, not the camera tile's).
+            uint8_t sampled = 0;
             int lightIdx = 0;
-            const uint8_t sampled = SampleFloorAt(floorX, floorY, &lightIdx);
+            if (!g_testTexture) {
+                sampled = SampleFloorAt(floorX, floorY, &lightIdx);
+            }
             if (sampled != 0) {
                 color = sampled;
                 g_diagFloorTex++;
                 if (lightIdx > 0 && lightIdx < static_cast<int>(std::size(LightTables)))
                     lightTable = LightTables[lightIdx].data();
+            } else if (g_testTexture) {
+                // Test texture: checkerboard in world space to verify floor UV mapping.
+                const int checkSize = 2; // 2 tile units per check
+                const int checkX = static_cast<int>(std::floor(floorX / checkSize)) % 2;
+                const int checkY = static_cast<int>(std::floor(floorY / checkSize)) % 2;
+                color = (checkX == checkY) ? 200 : 50;
             } else {
                 // Fallback floor color when the tile has no usable floor art.
                 color = 32;
@@ -841,7 +998,7 @@ void RenderDungeonRaycast(const Surface &out) {
         RayHit hit = CastRay(rayAngle);
 
         // Draw floor and ceiling first
-        DrawFloorCeiling(out, x, hit, screenWidth, screenHeight);
+        DrawFloorCeiling(out, x, screenWidth, screenHeight);
 
         // Draw wall if hit
         if (hit.hitWall) {
@@ -1016,6 +1173,22 @@ bool ProjectWorldToScreen(float worldX, float worldY, int screenWidth, int scree
 }
 
 /**
+ * True when nothing solid stands between the camera and the given point.
+ * Used to keep billboards behind walls from being drawn over them.
+ */
+bool IsPointVisible(float worldX, float worldY)
+{
+    const float dx = worldX - g_camera.x;
+    const float dy = worldY - g_camera.y;
+    const float angle = std::atan2(dx, -dy);
+    const RayHit hit = CastRay(angle);
+    const float distSq = dx * dx + dy * dy;
+    // Small margin so a sprite standing right at a wall face is not culled
+    // by its own wall.
+    return !hit.hitWall || hit.distance * hit.distance >= distSq - 0.04f;
+}
+
+/**
  * Render all visible sprites (monsters, players, items) as billboards
  */
 void RenderSprites(const Surface &out) {
@@ -1034,6 +1207,9 @@ void RenderSprites(const Surface &out) {
                 static_cast<float>(monster.position.tile.x) + 0.5f,
                 static_cast<float>(monster.position.tile.y) + 0.5f,
                 screenWidth, screenHeight, screenX, screenY, distance))
+            continue;
+        if (!IsPointVisible(static_cast<float>(monster.position.tile.x) + 0.5f,
+                static_cast<float>(monster.position.tile.y) + 0.5f))
             continue;
 
         // Get current sprite and light table
@@ -1064,6 +1240,8 @@ void RenderSprites(const Surface &out) {
                     static_cast<float>(y) + 0.5f,
                     screenWidth, screenHeight, screenX, screenY, distance))
                 continue;
+            if (!IsPointVisible(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f))
+                continue;
 
             // Use item's sprite
             const ClxSprite &sprite = item.AnimInfo.currentSprite();
@@ -1089,6 +1267,9 @@ void RenderSprites(const Surface &out) {
                 static_cast<float>(player.position.tile.y) + 0.5f,
                 screenWidth, screenHeight, screenX, screenY, distance))
             continue;
+        if (!IsPointVisible(static_cast<float>(player.position.tile.x) + 0.5f,
+                static_cast<float>(player.position.tile.y) + 0.5f))
+            continue;
 
         const ClxSprite &sprite = player.currentSprite();
 
@@ -1101,53 +1282,6 @@ void RenderSprites(const Surface &out) {
     }
 }
 
-/**
- * Convert camera yaw to the nearest game direction.
- */
-Direction YawToDirection(float yaw) {
-    while (yaw < 0) yaw += 2.0f * M_PI;
-    while (yaw >= 2.0f * M_PI) yaw -= 2.0f * M_PI;
-
-    const float sector = M_PI / 4.0f;
-    int sectorIdx = static_cast<int>((yaw + sector / 2.0f) / sector) % 8;
-
-    static const Direction sectorToDir[8] = {
-        Direction::North,
-        Direction::NorthEast,
-        Direction::East,
-        Direction::SouthEast,
-        Direction::South,
-        Direction::SouthWest,
-        Direction::West,
-        Direction::NorthWest
-    };
-
-    return sectorToDir[sectorIdx];
-}
-
-void SendFPWalkCommand(Direction dir) {
-    if (MyPlayer == nullptr)
-        return;
-
-    // Calculate target tile based on direction
-    Point target = MyPlayer->position.tile;
-    switch (dir) {
-        case Direction::North:    target.y -= 1; break;
-        case Direction::South:    target.y += 1; break;
-        case Direction::West:     target.x -= 1; break;
-        case Direction::East:     target.x += 1; break;
-        case Direction::NorthWest: target.x -= 1; target.y -= 1; break;
-        case Direction::NorthEast: target.x += 1; target.y -= 1; break;
-        case Direction::SouthWest: target.x -= 1; target.y += 1; break;
-        case Direction::SouthEast: target.x += 1; target.y += 1; break;
-        default: return;
-    }
-
-    // Check if target is valid
-    if (InDungeonBounds(target) && PosOkPlayer(*MyPlayer, target)) {
-        NetSendCmdLoc(MyPlayerId, true, CMD_WALKXY, target);
-    }
-}
 /**
  * Recompute the walk target from the currently held WASD keys and issue
  * a single-step walk command in the camera-relative direction.
@@ -1226,6 +1360,28 @@ void ProcessFPInput(const SDL_Event &event) {
  */
 void LogFpTextureStats()
 {
+    // One-shot dump of every piece's block layout. Ground truth for
+    // verifying asset mappings against real data instead of guessing.
+    // Enabled with DX_FP_DUMP_PIECES=1; each line is
+    //   PIECE <id> mt<i>:<frame>/<type> ...
+    static bool pieceDumpDone = false;
+    if (!pieceDumpDone) {
+        pieceDumpDone = true;
+        if (std::getenv("DX_FP_DUMP_PIECES") != nullptr) {
+            for (int p = 0; p < MAXTILES; ++p) {
+                std::string line;
+                for (int i = 0; i < static_cast<int>(MicroTileLen); ++i) {
+                    const LevelCelBlock b { DPieceMicros[p].mt[i] };
+                    if (!b.hasValue())
+                        continue;
+                    line += " mt" + std::to_string(i) + ":" + std::to_string(b.frame())
+                        + "/" + std::to_string(static_cast<int>(b.type()));
+                }
+                if (!line.empty())
+                    LogInfo("PIECE {} {} :{}", static_cast<int>(currlevel), p, line);
+            }
+        }
+    }
     std::string playerPiece = "none";
     std::string wallStack = "none";
     if (MyPlayer != nullptr) {
@@ -1421,6 +1577,13 @@ void ClearFirstPersonMouseDeltas()
 void ToggleFirstPersonGeometryDebug()
 {
     g_geoDebug = !g_geoDebug;
+    // Discard stale look deltas so toggling never jerks the camera.
+    ClearFirstPersonMouseDeltas();
+}
+
+void ToggleFirstPersonTestTexture()
+{
+    g_testTexture = !g_testTexture;
     // Discard stale look deltas so toggling never jerks the camera.
     ClearFirstPersonMouseDeltas();
 }

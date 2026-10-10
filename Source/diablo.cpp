@@ -1898,7 +1898,7 @@ void InitKeymapActions()
 		    "QuickSpell{}",
 		    N_("Quick spell {}"),
 		    N_("Hotkey for skill or spell."),
-		    i < 4 ? static_cast<uint32_t>(SDLK_F5) + i : static_cast<uint32_t>(SDLK_UNKNOWN),
+		    i < 4 ? static_cast<uint32_t>(SDLK_F7) + i : static_cast<uint32_t>(SDLK_UNKNOWN),
 		    [i]() {
 			    if (SpellSelectFlag) {
 				    SetSpeedSpell(i);
@@ -2167,6 +2167,17 @@ void InitKeymapActions()
 	    [] {
 		    if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson)
 			    ToggleFirstPersonGeometryDebug();
+	    },
+	    nullptr,
+	    CanPlayerTakeAction);
+	options.Keymapper.AddAction(
+	    "ToggleFPTestTexture",
+	    N_("Toggle FPS Test Texture"),
+	    N_("Show checkerboard test texture in first-person view (developer diagnostic)."),
+	    SDLK_F7,
+	    [] {
+		    if (*GetOptions().Graphics.renderMode == RenderMode::FirstPerson)
+			    ToggleFirstPersonTestTexture();
 	    },
 	    nullptr,
 	    CanPlayerTakeAction);
